@@ -467,18 +467,17 @@ def apply_theme(theme: str):
 
 
 def render_topbar():
-    left, right = st.columns([0.72, 0.28])
+    """Stable top bar with no raw HTML, so it renders cleanly on all pages/devices."""
+    left, right = st.columns([0.65, 0.35], vertical_alignment="center")
     with left:
-        st.markdown(
-            '<div class="brand-pill">💠 AI Customer Support Recovery System</div>',
-            unsafe_allow_html=True,
-        )
+        st.caption("AI Support Recovery System")
     with right:
         theme = st.selectbox(
             "Theme",
             ["Light", "Dark"],
             index=0 if st.session_state.get("theme", "Light") == "Light" else 1,
             key="theme_select",
+            label_visibility="collapsed",
         )
         st.session_state.theme = theme
 
@@ -496,16 +495,20 @@ def hero(title: str, subtitle: str):
 
 
 def kpi_grid(items: List[Tuple[str, str]]):
-    html_cards = '<div class="kpi-grid">'
-    for label, value in items:
-        html_cards += f"""
-        <div class="kpi-card">
-            <div class="kpi-value">{safe_text(value)}</div>
-            <div class="kpi-label">{safe_text(label)}</div>
-        </div>
-        """
-    html_cards += "</div>"
-    st.markdown(html_cards, unsafe_allow_html=True)
+    """Render KPI cards using native Streamlit containers to avoid raw HTML showing in the UI."""
+    if not items:
+        return
+
+    max_cols = min(len(items), 5)
+    rows = [items[i:i + max_cols] for i in range(0, len(items), max_cols)]
+
+    for row in rows:
+        cols = st.columns(len(row), gap="medium")
+        for col, (label, value) in zip(cols, row):
+            with col:
+                with st.container(border=True):
+                    st.markdown(f"### {display_value(value)}")
+                    st.caption(display_value(label, ""))
 
 
 def badge(text: str, kind: str = "gray") -> str:
