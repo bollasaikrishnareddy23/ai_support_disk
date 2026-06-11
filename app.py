@@ -632,20 +632,44 @@ def detect_sarcasm(text: str) -> bool:
 
 
 def classify_topic(text: str, selected_hint: str = "Auto Detect", previous_topic: str = "") -> Tuple[str, float]:
+    """Classify the customer's issue topic.
+
+    This version is intentionally context-aware. A phrase like
+    "where is my product" or "I haven't received my product" is a
+    delivery/tracking problem, not a product-quality problem.
+    """
     t = clean_text(text)
 
-    if selected_hint and selected_hint != "Auto Detect" and selected_hint in ISSUE_TOPICS:
-        # Use as gentle context unless the text strongly says otherwise.
-        hint_topic = selected_hint
-    else:
-        hint_topic = ""
+    hint_topic = selected_hint if selected_hint and selected_hint != "Auto Detect" and selected_hint in ISSUE_TOPICS else ""
 
-    delivery = ["delivery", "shipping", "shipment", "late", "delay", "delayed", "package", "order", "where is", "tracking", "arrive", "arrived", "eta", "possible date", "when", "missing", "not received", "delivered"]
-    refund = ["refund", "money back", "return", "chargeback", "refund status"]
-    billing = ["charged", "payment", "billing", "bill", "invoice", "paid", "card", "transaction", "charged twice", "double charge"]
-    product = ["broken", "damaged", "defective", "faulty", "quality", "wrong product", "wrong item", "replacement", "item broke"]
-    service = ["support", "customer service", "agent", "representative", "no reply", "nobody helped", "ignored", "rude agent"]
-    technical = ["app", "website", "login", "password", "error", "crash", "bug", "not working", "technical", "reset"]
+    delivery = [
+        "delivery", "shipping", "shipment", "late", "delay", "delayed", "package", "parcel",
+        "order status", "where is", "tracking", "track", "arrive", "arrived", "arrival",
+        "eta", "possible date", "expected date", "delivery date", "arrival date", "when will",
+        "when can", "missing", "not received", "did not receive", "didnt receive", "havent received",
+        "haven received", "not got", "not get", "never received", "no update", "delivered but",
+        "where is my product", "where is my order", "product not received", "haven't received"
+    ]
+    refund = [
+        "refund", "money back", "return my money", "return money", "chargeback", "refund status",
+        "give my money", "want my money", "money refund"
+    ]
+    billing = [
+        "charged", "payment", "billing", "bill", "invoice", "paid", "card", "transaction",
+        "charged twice", "double charge", "wrong amount", "payment failed"
+    ]
+    product = [
+        "broken", "damaged", "defective", "faulty", "quality", "wrong product", "wrong item",
+        "replacement", "item broke", "not working product", "product damaged", "item damaged"
+    ]
+    service = [
+        "support", "customer service", "agent", "representative", "no reply", "nobody helped",
+        "ignored", "rude agent", "no response", "not responding", "support team"
+    ]
+    technical = [
+        "app", "website", "login", "password", "error", "crash", "bug", "not working",
+        "technical", "reset", "otp", "verification", "account locked"
+    ]
 
     scores = {
         "Delivery Issue": sum(1 for w in delivery if w in t),
@@ -656,13 +680,23 @@ def classify_topic(text: str, selected_hint: str = "Auto Detect", previous_topic
         "Technical Issue": sum(1 for w in technical if w in t),
     }
 
-    # Common correction: "where is my product" is delivery/tracking, not product quality.
-    if "where is" in t or "possible date" in t or "eta" in t:
-        scores["Delivery Issue"] += 3
+    # Strong intent corrections.
+    if any(p in t for p in ["where is", "not received", "did not receive", "didnt receive", "havent received", "haven't received", "missing", "expected date", "possible date", "eta"]):
+        scores["Delivery Issue"] += 4
+    if "refund" in t or "money back" in t or "return my money" in t:
+        scores["Refund Issue"] += 4
+    if "charged twice" in t or "double charge" in t:
+        scores["Billing Issue"] += 4
 
-    # If customer sends only a reference, keep previous topic if known.
-    if is_order_reference(text) and previous_topic:
-        return previous_topic, 0.70
+    # Short follow-up messages should keep the existing case topic.
+    followup_words = ["when", "date", "expected", "possible", "status", "update", "what about", "any update"]
+    if previous_topic and (is_order_reference(text) or any(w in t for w in followup_words)):
+        if previous_topic in ISSUE_TOPICS:
+            # For date/status follow-ups, delivery is usually the intended context if the previous case was delivery/product/order related.
+            if any(w in t for w in ["date", "expected", "possible", "when", "eta", "status", "update"]):
+                if previous_topic in ["Delivery Issue", "Product Issue", "General Complaint"]:
+                    return "Delivery Issue", 0.76
+            return previous_topic, 0.72
 
     best_topic = max(scores, key=scores.get)
     best_score = scores[best_topic]
@@ -674,9 +708,8 @@ def classify_topic(text: str, selected_hint: str = "Auto Detect", previous_topic
     if best_score == 0:
         return "General Complaint", 0.45
 
-    confidence = min(0.95, 0.58 + best_score * 0.12)
+    confidence = min(0.96, 0.58 + best_score * 0.11)
     return best_topic, confidence
-
 
 def detect_emotion_rules(text: str, tone: str, topic: str) -> Tuple[str, float]:
     t = clean_text(text)
@@ -877,47 +910,96 @@ def generate_customer_reply(
     is_reference: bool,
     previous_topic: str = "",
 ) -> str:
-    t = clean_text(message)
+    """Generate a customer-facing reply that matches the exact message.
 
-    if is_greeting(message):
+    The reply must be helpful but safe: it should never promise a refund,
+    coupon, delivery date, or immediate manager call.
+    """
+    raw = str(message).strip()
+    t = clean_text(raw)
+
+    if is_greeting(raw):
         return "Hi! How can I help you today? You can tell me about a delivery, refund, billing, product, technical, or support issue."
-    if is_thanks(message):
+
+    if is_thanks(raw):
         return "You’re welcome. Is there anything else you want me to add to this support case?"
+
     if manager_request:
-        return "I understand. I’ve marked your case for manager review so a manager or senior support member can review it."
+        return "I understand. I’ve escalated your case for manager review so a manager or senior support member can review it."
+
     if is_reference:
         if previous_topic == "Delivery Issue":
-            return f"Thank you. I’ve noted the reference {message.strip()} so the delivery team can check the tracking status."
-        return f"Thank you. I’ve added the reference {message.strip()} to your support case."
-    if tone == "Rude":
-        return "I understand you’re upset. I’m here to help, but please describe the issue clearly so I can record it properly for our team."
-    if tone == "Sarcastic":
-        return "I’m sorry this has been frustrating. I’ve recorded the issue and the team will review what went wrong."
+            return f"Thank you. I’ve added reference {raw} to your case so the delivery team can check the tracking or order status."
+        if previous_topic == "Refund Issue":
+            return f"Thank you. I’ve added reference {raw} to your refund case so the team can review the order details."
+        return f"Thank you. I’ve added reference {raw} to your support case."
 
-    # Context-aware follow-ups.
-    if any(w in t for w in ["possible date", "eta", "when will", "when", "date"]):
-        if previous_topic == "Delivery Issue" or topic == "Delivery Issue":
-            return "I understand you want the expected delivery date. I’ve added that to your case so the delivery team can check the latest status."
+    has_clear_issue = topic != "General Complaint"
+
+    # Delivery ETA/date follow-up. This should answer the customer's actual question.
+    if any(w in t for w in ["expected date", "possible date", "delivery date", "arrival date", "eta", "when will", "when can", "tell me expected", "tell me possible", "date"]):
+        if topic == "Delivery Issue" or previous_topic in ["Delivery Issue", "Product Issue"]:
+            return "I understand you want the expected delivery date. I can’t confirm an exact date in this chat, but I’ve added your ETA request so the delivery team can check the latest tracking status."
+
+    # Rude messages with a real issue should still be handled by issue type, not ignored.
+    rude_prefix = "I understand you’re upset. " if tone == "Rude" else ""
+    sarcastic_prefix = "I’m sorry this has been frustrating. " if tone == "Sarcastic" else ""
+    prefix = rude_prefix or sarcastic_prefix
+
+    if tone == "Rude" and not has_clear_issue:
+        return "I understand you’re upset. I can help, but please tell me the issue clearly — for example delivery, refund, billing, product, technical, or support."
 
     if topic == "Delivery Issue":
-        if "where is" in t or "missing" in t or "not received" in t:
-            return "I’m sorry you haven’t received your package. I’ve recorded this as a delivery issue so the team can check the tracking status."
-        return "I’m sorry about the delivery problem. I’ve recorded the details so the delivery team can review the delay or shipment status."
+        if any(p in t for p in ["not received", "did not receive", "didnt receive", "havent received", "haven't received", "missing", "where is"]):
+            return prefix + "I’ve recorded this as a missing or delayed delivery issue so the delivery team can check the order status and tracking details."
+        if any(p in t for p in ["late", "delayed", "delay", "no update"]):
+            return prefix + "I’ve recorded the delivery delay so the team can check the shipment status and why there has been no update."
+        return prefix + "I’ve recorded this as a delivery issue so the team can review the shipment status and next update."
+
     if topic == "Refund Issue":
-        return "I understand your concern about the refund. I’ve recorded your refund request so the team can review the order and follow up with the next steps."
+        return prefix + "I understand your refund concern. I’ve recorded your refund request so the team can review the order and follow up with the next steps."
+
     if topic == "Billing Issue":
-        return "Thank you for reporting the billing issue. I’ve recorded it so the billing team can review the payment details carefully."
+        if "charged twice" in t or "double charge" in t:
+            return prefix + "I’ve recorded the duplicate charge issue so the billing team can review the payment details carefully."
+        return prefix + "I’ve recorded the billing concern so the billing team can review the payment or invoice details."
+
     if topic == "Product Issue":
-        return "I’m sorry about the product issue. I’ve recorded the details so the team can review replacement, return, or support options."
+        if any(p in t for p in ["broken", "damaged", "defective", "faulty"]):
+            return prefix + "I’m sorry the product arrived in that condition. I’ve recorded this so the team can review replacement, return, or support options."
+        return prefix + "I’ve recorded this product issue so the team can review the item condition and possible support options."
+
     if topic == "Technical Issue":
-        return "Thank you for reporting the technical issue. I’ve recorded the problem so the technical team can review it."
+        return prefix + "I’ve recorded the technical issue so the technical team can review the problem and help with the next steps."
+
     if topic == "Customer Service Issue":
-        return "I’m sorry about the support experience. I’ve recorded this so the team can review the service issue."
+        return prefix + "I’m sorry about the support experience. I’ve recorded this so the team can review the service issue and follow up properly."
 
-    if len(t.split()) <= 3:
-        return "Can you share a little more detail about the issue so I can record it correctly for our team?"
-    return "Thank you for sharing this. I’ve added the details to your support case so our team can review it."
+    # Short unclear messages should ask a useful follow-up question, not create a generic reply.
+    if len(t.split()) <= 4:
+        return "Can you share a little more detail about what happened? For example, is this about delivery, refund, billing, product, technical support, or customer service?"
 
+    return "Thank you for explaining. I’ve recorded your message as a support case so our team can review it and decide the next step."
+
+
+def should_create_or_update_case(message: str, analysis: Dict) -> bool:
+    """Decide whether this message should create/update a support case.
+
+    Greetings do not create cases. Pure rude messages without an issue do not
+    create a case unless a case already exists. Real complaints, order refs,
+    manager requests, and follow-ups update the active case.
+    """
+    if is_greeting(message) or is_thanks(message):
+        return bool(st.session_state.get("active_case_id", ""))
+    if is_manager_escalation_request(message):
+        return True
+    if is_order_reference(message):
+        return bool(st.session_state.get("active_case_id", ""))
+    if analysis.get("complaint_topic") != "General Complaint":
+        return True
+    if detect_rude_tone(message):
+        return bool(st.session_state.get("active_case_id", ""))
+    return len(clean_text(message).split()) >= 5
 
 def analyze_message(message: str, selected_hint: str = "Auto Detect") -> Dict:
     previous = get_previous_case_context()
@@ -1471,14 +1553,11 @@ if page == "AI Support Chat":
         with st.chat_message("user"):
             st.write(user_message)
 
-        # Greetings/thanks do not create a case unless there is already an active case.
-        if (is_greeting(user_message) or is_thanks(user_message)) and not st.session_state.active_case_id:
-            reply = generate_customer_reply(user_message, "General Complaint", detect_tone(user_message), False, False, "")
-            st.session_state.chat_messages.append({"role": "assistant", "content": reply})
-            with st.chat_message("assistant"):
-                st.write(reply)
-        else:
-            analysis = analyze_message(user_message, st.session_state.selected_issue_type)
+        analysis = analyze_message(user_message, st.session_state.selected_issue_type)
+        reply = analysis["customer_reply"]
+        st.session_state.chat_messages.append({"role": "assistant", "content": reply})
+
+        if should_create_or_update_case(user_message, analysis):
             case_id = get_active_case_id()
             coupon = suggest_recovery_coupon(
                 analysis["risk_level"],
@@ -1487,13 +1566,14 @@ if page == "AI Support Chat":
                 case_id,
                 is_manager_escalation_request(user_message),
             )
-            reply = analysis["customer_reply"]
-            st.session_state.chat_messages.append({"role": "assistant", "content": reply})
             case_id = create_or_update_case(st.session_state.chat_customer_id, user_message, analysis, coupon)
             st.session_state.last_case_id = case_id
             with st.chat_message("assistant"):
                 st.write(reply)
                 st.caption(f"Support case: {case_id}")
+        else:
+            with st.chat_message("assistant"):
+                st.write(reply)
 
 # ============================================================
 # Page: Manager Command Center
