@@ -1,22 +1,15 @@
 # ============================================================
-# VoiceOps AI Support Desk
-# GitHub-ready Streamlit app
+# AI Customer Support Recovery System
+# Streamlit customer chatbot + manager command center
 #
-# Customer side:
-# - Guided real-time support chatbot
-# - One chat session = one support case
-# - Dynamic customer replies based on message/topic/context
-#
-# Manager side:
-# - Private command center
-# - Risk score, emotion, topic, business risk
-# - SLA tracking, owner assignment, notes, resolution
-# - Recovery coupon recommendation and approval workflow
-#
-# Performance design:
-# - Fast rule-based analysis is always available
-# - Gemini API is optional
-# - Local transformer models are optional and disabled by default
+# Key design:
+# - Customers chat normally.
+# - One active chat = one support case.
+# - Greetings/small talk do not create cases.
+# - Manager escalation requests are detected and prioritized.
+# - Coupon offers are manager-only, never shown to customers.
+# - Manager dashboard is customer-level, not message-level.
+# - Optional transformer emotion model can be enabled with secrets.
 # ============================================================
 
 import os
@@ -25,23 +18,25 @@ import json
 import hmac
 import html
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple, Any
 
 import pandas as pd
 import streamlit as st
 
 try:
     from google import genai
-except Exception:  # App still runs without Gemini package, but requirements include it.
+    from google.genai import types
+except Exception:
     genai = None
+    types = None
 
 
 # ============================================================
-# Page Config
+# Page config
 # ============================================================
 
 st.set_page_config(
-    page_title="VoiceOps AI Support Desk",
+    page_title="AI Support Recovery System",
     page_icon="🎧",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -52,44 +47,25 @@ st.set_page_config(
 # Constants
 # ============================================================
 
-DATA_FILE = "complaint_records.csv"
-DEFAULT_GEMINI_MODEL = "gemini-2.0-flash"
+APP_NAME = "AI Support Recovery"
+DATA_FILE = "support_cases.csv"
+GEMINI_MODEL = "gemini-2.0-flash"
 HIGH_RISK_THRESHOLD = 70
 MEDIUM_RISK_THRESHOLD = 40
-
-ISSUE_TYPES = [
-    "Not sure yet",
-    "Delivery Issue",
-    "Refund Issue",
-    "Billing Issue",
-    "Product Issue",
-    "Technical Issue",
-    "Customer Service Issue",
-    "General Complaint",
-]
-
-STATUS_OPTIONS = ["New", "In Progress", "Escalated", "Resolved"]
-OWNER_OPTIONS = [
-    "Unassigned",
-    "Support Team",
-    "Billing Team",
-    "Delivery Team",
-    "Technical Team",
-    "Product Team",
-    "Manager",
-]
 
 EXPECTED_COLUMNS = [
     "case_id",
     "customer_id",
     "timestamp",
+    "last_updated",
     "message",
     "conversation",
     "clean_text",
     "analysis_source",
     "emotion",
-    "sarcasm_detected",
-    "sarcasm_reason",
+    "tone",
+    "sarcasm",
+    "escalation_requested",
     "complaint_topic",
     "customer_intent",
     "business_risk",
@@ -100,236 +76,318 @@ EXPECTED_COLUMNS = [
     "customer_reply",
     "status",
     "assigned_to",
-    "internal_notes",
     "resolution_action",
     "coupon_offer",
     "coupon_code",
     "coupon_status",
     "coupon_reason",
-    "last_updated",
+    "emotion_journey",
+    "topic_journey",
+    "risk_journey",
 ]
 
 
 # ============================================================
-# Custom Styling
+# Utility
 # ============================================================
 
-st.markdown(
-    """
-    <style>
-        :root {
-            --bg: #f6f8fb;
-            --ink: #0f172a;
-            --muted: #64748b;
-            --line: #e2e8f0;
-            --blue: #2563eb;
-            --green: #16a34a;
-            --amber: #d97706;
-            --red: #dc2626;
-            --purple: #7c3aed;
-        }
+def is_blank(value: Any) -> bool:
+    if value is None:
+        return True
+    text = str(value).strip()
+    return text == "" or text.lower() in ["nan", "none", "nat"]
 
-        .stApp {
-            background:
-                radial-gradient(circle at top left, rgba(37, 99, 235, 0.10), transparent 32%),
-                radial-gradient(circle at top right, rgba(124, 58, 237, 0.10), transparent 30%),
-                linear-gradient(180deg, #f8fafc 0%, #eef2f7 100%);
-        }
 
-        .block-container {
-            padding-top: 1.4rem;
-            padding-bottom: 2.5rem;
-            max-width: 1300px;
-        }
+def clean_display(value: Any, fallback: str = "—") -> str:
+    if is_blank(value):
+        return fallback
+    return str(value)
 
-        section[data-testid="stSidebar"] {
-            background: #0b1220;
-            border-right: 1px solid rgba(255,255,255,0.08);
-        }
 
-        section[data-testid="stSidebar"] * {
-            color: #f8fafc !important;
-        }
+def safe_text(value: Any) -> str:
+    return html.escape(clean_display(value, ""))
 
-        .hero {
-            background:
-                linear-gradient(135deg, rgba(15, 23, 42, 0.98), rgba(30, 41, 59, 0.96)),
-                radial-gradient(circle at 85% 15%, rgba(59,130,246,0.45), transparent 32%);
-            color: white;
-            padding: 32px 34px;
-            border-radius: 30px;
-            margin-bottom: 22px;
-            box-shadow: 0 24px 55px rgba(15, 23, 42, 0.24);
-            border: 1px solid rgba(255,255,255,0.10);
-        }
 
-        .hero h1 {
-            font-size: 42px;
-            line-height: 1.05;
-            margin: 0 0 10px 0;
-            font-weight: 900;
-            letter-spacing: -0.04em;
-        }
+def now_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        .hero p {
-            color: #cbd5e1;
-            font-size: 17px;
-            max-width: 900px;
-            margin: 0;
-            line-height: 1.55;
-        }
 
-        .glass-card {
-            background: rgba(255, 255, 255, 0.90);
-            border: 1px solid rgba(226, 232, 240, 0.95);
-            border-radius: 24px;
-            padding: 22px;
-            box-shadow: 0 16px 38px rgba(15, 23, 42, 0.08);
-            backdrop-filter: blur(10px);
-            margin-bottom: 18px;
-        }
+def clean_text(text: str) -> str:
+    text = str(text).lower()
+    text = re.sub(r"http\S+|www\S+", "", text)
+    text = re.sub(r"@\w+", "", text)
+    text = re.sub(r"#", "", text)
+    text = re.sub(r"[^a-zA-Z0-9\s]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
-        .case-card {
-            background: white;
-            border: 1px solid #e2e8f0;
-            border-radius: 24px;
-            padding: 22px;
-            box-shadow: 0 12px 30px rgba(15, 23, 42, 0.08);
-            margin-bottom: 16px;
-        }
 
-        .case-title {
-            font-size: 20px;
-            font-weight: 900;
-            color: #0f172a;
-            margin-bottom: 5px;
-        }
-
-        .case-meta {
-            color: #64748b;
-            font-size: 13px;
-            margin-bottom: 12px;
-        }
-
-        .case-message {
-            color: #334155;
-            font-size: 15px;
-            line-height: 1.58;
-            margin-top: 14px;
-            padding: 14px;
-            border-radius: 16px;
-            background: #f8fafc;
-            border: 1px solid #e2e8f0;
-        }
-
-        .kpi-card {
-            background: rgba(255,255,255,0.95);
-            border: 1px solid #e2e8f0;
-            border-radius: 22px;
-            padding: 20px;
-            box-shadow: 0 12px 28px rgba(15, 23, 42, 0.08);
-            min-height: 112px;
-        }
-
-        .kpi-value {
-            font-size: 34px;
-            font-weight: 900;
-            color: #0f172a;
-            letter-spacing: -0.04em;
-        }
-
-        .kpi-label {
-            color: #64748b;
-            font-size: 14px;
-            margin-top: 4px;
-        }
-
-        .section-title {
-            font-size: 22px;
-            font-weight: 900;
-            color: #0f172a;
-            margin-bottom: 8px;
-            letter-spacing: -0.02em;
-        }
-
-        .muted {
-            color: #64748b;
-            font-size: 14px;
-            line-height: 1.6;
-        }
-
-        .badge {
-            display: inline-block;
-            padding: 6px 11px;
-            border-radius: 999px;
-            font-size: 12px;
-            font-weight: 800;
-            margin-right: 6px;
-            margin-bottom: 6px;
-            border: 1px solid rgba(0,0,0,0.04);
-        }
-
-        .badge-high { background: #fee2e2; color: #991b1b; }
-        .badge-medium { background: #fef3c7; color: #92400e; }
-        .badge-low { background: #dcfce7; color: #166534; }
-        .badge-critical { background: #7f1d1d; color: #ffffff; }
-        .badge-blue { background: #dbeafe; color: #1e40af; }
-        .badge-gray { background: #f1f5f9; color: #334155; }
-        .badge-purple { background: #ede9fe; color: #5b21b6; }
-        .badge-overdue { background: #fee2e2; color: #991b1b; }
-        .badge-track { background: #dcfce7; color: #166534; }
-        .badge-closed { background: #e0e7ff; color: #3730a3; }
-        .badge-coupon { background: #fff7ed; color: #9a3412; }
-        .badge-sarcasm { background: #fae8ff; color: #86198f; }
-
-        div.stButton > button,
-        div.stFormSubmitButton > button {
-            border-radius: 14px;
-            border: none;
-            background: #2563eb;
-            color: white;
-            font-weight: 800;
-            padding: 0.65rem 1.1rem;
-            box-shadow: 0 10px 18px rgba(37, 99, 235, 0.20);
-        }
-
-        div.stButton > button:hover,
-        div.stFormSubmitButton > button:hover {
-            background: #1d4ed8;
-            color: white;
-        }
-
-        .stTextInput input,
-        .stTextArea textarea,
-        .stSelectbox div[data-baseweb="select"] {
-            border-radius: 14px !important;
-        }
-
-        div[data-testid="stChatMessage"] {
-            border-radius: 18px;
-            padding: 0.25rem;
-        }
-
-        #MainMenu { visibility: hidden; }
-        footer { visibility: hidden; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+def create_case_id() -> str:
+    return "CASE-" + datetime.now().strftime("%m%d%H%M%S%f")[-14:]
 
 
 # ============================================================
-# UI Helpers
+# Theme and CSS
 # ============================================================
 
-def safe_text(value) -> str:
-    return html.escape(str(value))
+if "ui_theme" not in st.session_state:
+    st.session_state.ui_theme = "Light"
+
+
+def apply_css(theme: str) -> None:
+    dark = theme == "Dark"
+
+    bg = "#07111f" if dark else "#eef5ff"
+    bg2 = "#0f172a" if dark else "#e8fff6"
+    text = "#e5eefc" if dark else "#0f172a"
+    muted = "#9fb0c9" if dark else "#64748b"
+    card = "rgba(15, 23, 42, 0.82)" if dark else "rgba(255, 255, 255, 0.88)"
+    card_border = "rgba(148, 163, 184, 0.28)" if dark else "rgba(226, 232, 240, 0.95)"
+    input_bg = "#111c2f" if dark else "#f8fafc"
+    sidebar = "#050b16" if dark else "#06111f"
+    hero1 = "#051024" if dark else "#101828"
+    hero2 = "#10203a" if dark else "#1e40af"
+
+    st.markdown(
+        f"""
+        <style>
+            :root {{
+                --bg: {bg};
+                --bg2: {bg2};
+                --text: {text};
+                --muted: {muted};
+                --card: {card};
+                --card-border: {card_border};
+                --input-bg: {input_bg};
+                --hero1: {hero1};
+                --hero2: {hero2};
+            }}
+
+            .stApp {{
+                background:
+                    radial-gradient(circle at top right, rgba(45, 212, 191, 0.25), transparent 36%),
+                    radial-gradient(circle at 15% 10%, rgba(37, 99, 235, 0.22), transparent 32%),
+                    linear-gradient(135deg, var(--bg) 0%, var(--bg2) 100%);
+                color: var(--text);
+            }}
+
+            .block-container {{
+                padding-top: 1.2rem;
+                padding-bottom: 2rem;
+                max-width: 1260px;
+            }}
+
+            section[data-testid="stSidebar"] {{
+                background: {sidebar};
+            }}
+            section[data-testid="stSidebar"] * {{
+                color: #f8fafc !important;
+            }}
+
+            .app-hero {{
+                background:
+                    linear-gradient(135deg, var(--hero1) 0%, var(--hero2) 100%);
+                color: white;
+                padding: 28px 32px;
+                border-radius: 30px;
+                margin-bottom: 22px;
+                box-shadow: 0 25px 60px rgba(2, 6, 23, 0.24);
+                position: relative;
+                overflow: hidden;
+            }}
+            .app-hero:after {{
+                content: "";
+                position: absolute;
+                right: -70px;
+                top: -80px;
+                width: 240px;
+                height: 240px;
+                border-radius: 999px;
+                background: rgba(255,255,255,0.14);
+            }}
+            .app-hero h1 {{
+                font-size: 40px;
+                line-height: 1.08;
+                margin: 0 0 10px 0;
+                letter-spacing: -0.035em;
+                font-weight: 900;
+            }}
+            .app-hero p {{
+                margin: 0;
+                max-width: 860px;
+                color: #dbeafe;
+                font-size: 16px;
+                line-height: 1.55;
+            }}
+
+            .glass-card {{
+                background: var(--card);
+                border: 1px solid var(--card-border);
+                border-radius: 24px;
+                padding: 22px;
+                box-shadow: 0 16px 42px rgba(2, 6, 23, 0.10);
+                backdrop-filter: blur(16px);
+                margin-bottom: 18px;
+                color: var(--text);
+            }}
+
+            .mini-card {{
+                background: var(--card);
+                border: 1px solid var(--card-border);
+                border-radius: 20px;
+                padding: 18px;
+                box-shadow: 0 12px 28px rgba(2, 6, 23, 0.08);
+                margin-bottom: 16px;
+                color: var(--text);
+            }}
+
+            .section-title {{
+                font-size: 20px;
+                font-weight: 900;
+                color: var(--text);
+                margin-bottom: 7px;
+                letter-spacing: -0.02em;
+            }}
+            .muted {{
+                color: var(--muted);
+                font-size: 14px;
+                line-height: 1.55;
+            }}
+
+            .kpi-card {{
+                background: var(--card);
+                border: 1px solid var(--card-border);
+                border-radius: 24px;
+                padding: 20px;
+                min-height: 112px;
+                box-shadow: 0 16px 36px rgba(2, 6, 23, 0.08);
+            }}
+            .kpi-value {{
+                font-size: 34px;
+                font-weight: 900;
+                color: var(--text);
+                letter-spacing: -0.04em;
+            }}
+            .kpi-label {{
+                color: var(--muted);
+                font-size: 13px;
+                margin-top: 5px;
+            }}
+
+            .bot-row, .user-row {{
+                display: flex;
+                gap: 12px;
+                align-items: flex-start;
+                margin: 14px 0;
+            }}
+            .user-row {{
+                justify-content: flex-end;
+            }}
+            .avatar-bot, .avatar-user {{
+                width: 34px;
+                height: 34px;
+                border-radius: 12px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                color: white;
+                font-weight: 900;
+                flex-shrink: 0;
+            }}
+            .avatar-bot {{ background: linear-gradient(135deg, #f59e0b, #f97316); }}
+            .avatar-user {{ background: linear-gradient(135deg, #ef4444, #f43f5e); }}
+            .msg-bubble {{
+                max-width: 82%;
+                background: var(--card);
+                color: var(--text);
+                border: 1px solid var(--card-border);
+                padding: 13px 15px;
+                border-radius: 18px;
+                line-height: 1.55;
+                box-shadow: 0 10px 26px rgba(2, 6, 23, 0.06);
+            }}
+            .user-row .msg-bubble {{
+                background: rgba(37, 99, 235, 0.12);
+                border-color: rgba(37, 99, 235, 0.22);
+            }}
+
+            .badge {{
+                display: inline-block;
+                padding: 6px 11px;
+                border-radius: 999px;
+                font-size: 12px;
+                font-weight: 800;
+                margin-right: 6px;
+                margin-bottom: 6px;
+            }}
+            .badge-high {{ background:#fee2e2; color:#991b1b; }}
+            .badge-medium {{ background:#fef3c7; color:#92400e; }}
+            .badge-low {{ background:#dcfce7; color:#166534; }}
+            .badge-critical {{ background:#7f1d1d; color:#fff; }}
+            .badge-blue {{ background:#dbeafe; color:#1e40af; }}
+            .badge-gray {{ background:#f1f5f9; color:#334155; }}
+            .badge-purple {{ background:#ede9fe; color:#5b21b6; }}
+            .badge-coupon {{ background:#ffedd5; color:#9a3412; }}
+            .badge-dark {{ background:#e2e8f0; color:#0f172a; }}
+
+            .path-wrap {{
+                display:flex;
+                flex-wrap:wrap;
+                gap:10px;
+                margin: 12px 0;
+            }}
+            .path-pill {{
+                padding: 10px 14px;
+                border-radius: 999px;
+                font-weight: 850;
+                background: var(--card);
+                border: 1px solid var(--card-border);
+                box-shadow: 0 8px 18px rgba(2, 6, 23, 0.06);
+            }}
+            .path-arrow {{
+                color: var(--muted);
+                font-weight: 900;
+                align-self: center;
+            }}
+
+            div.stButton > button, div.stFormSubmitButton > button {{
+                border-radius: 14px;
+                border: none;
+                background: linear-gradient(135deg, #2563eb, #4f46e5);
+                color: white;
+                font-weight: 850;
+                padding: 0.65rem 1.1rem;
+                box-shadow: 0 10px 22px rgba(37, 99, 235, 0.25);
+            }}
+            div.stButton > button:hover, div.stFormSubmitButton > button:hover {{
+                background: linear-gradient(135deg, #1d4ed8, #4338ca);
+                color: white;
+            }}
+            .stTextInput input, .stTextArea textarea, .stSelectbox div[data-baseweb="select"] {{
+                border-radius: 14px !important;
+                background: var(--input-bg) !important;
+            }}
+
+            #MainMenu {{ visibility: hidden; }}
+            footer {{ visibility: hidden; }}
+
+            @media (max-width: 900px) {{
+                .block-container {{ padding-left: 1rem; padding-right: 1rem; }}
+                .app-hero {{ padding: 22px; border-radius: 22px; }}
+                .app-hero h1 {{ font-size: 28px; }}
+                .msg-bubble {{ max-width: 92%; }}
+                .kpi-value {{ font-size: 26px; }}
+            }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def hero(title: str, subtitle: str) -> None:
     st.markdown(
         f"""
-        <div class="hero">
+        <div class="app-hero">
             <h1>{safe_text(title)}</h1>
             <p>{safe_text(subtitle)}</p>
         </div>
@@ -338,7 +396,7 @@ def hero(title: str, subtitle: str) -> None:
     )
 
 
-def kpi_card(label: str, value) -> None:
+def kpi_card(label: str, value: Any) -> None:
     st.markdown(
         f"""
         <div class="kpi-card">
@@ -350,169 +408,77 @@ def kpi_card(label: str, value) -> None:
     )
 
 
-def badge(text: str, kind: str) -> str:
+def badge(text: str, kind: str = "gray") -> str:
     return f'<span class="badge badge-{kind}">{safe_text(text)}</span>'
 
 
-def risk_badge(level: str) -> str:
-    kind = "high" if level == "High" else "medium" if level == "Medium" else "low"
-    return badge(f"{level} Risk", kind)
-
-
-def priority_badge(priority: str) -> str:
-    kind = "critical" if priority == "Critical" else "high" if priority == "High" else "medium" if priority == "Medium" else "low"
-    return badge(f"{priority} Priority", kind)
-
-
-def sla_badge(value: str) -> str:
-    kind = "overdue" if value == "Overdue" else "closed" if value == "Closed" else "track"
-    return badge(value, kind)
-
-
-
-def inject_device_and_theme_css(theme: str) -> None:
-    """Apply responsive layout fixes and optional dark mode overrides."""
-    dark = str(theme).lower() == "dark"
-    if dark:
-        css = """
-        <style>
-            .stApp {
-                background:
-                    radial-gradient(circle at top left, rgba(37, 99, 235, 0.20), transparent 32%),
-                    radial-gradient(circle at top right, rgba(124, 58, 237, 0.18), transparent 34%),
-                    linear-gradient(180deg, #020617 0%, #0f172a 100%) !important;
-                color: #e5e7eb !important;
-            }
-            .glass-card, .ops-grid-card, .chat-wrap, .case-card, .queue-card, .intel-card, .kpi-card, .emotion-node {
-                background: rgba(15, 23, 42, 0.88) !important;
-                border-color: rgba(148, 163, 184, 0.28) !important;
-                box-shadow: 0 18px 45px rgba(0,0,0,0.28) !important;
-            }
-            .section-title, .ops-card-title, .case-title, .kpi-value, .emotion-name {
-                color: #f8fafc !important;
-            }
-            .muted, .case-meta, .kpi-label, .emotion-meta, .flow-text {
-                color: #cbd5e1 !important;
-            }
-            .case-message {
-                background: rgba(30, 41, 59, 0.80) !important;
-                color: #e2e8f0 !important;
-                border-color: rgba(148, 163, 184, 0.22) !important;
-            }
-            .stDataFrame, div[data-testid="stDataFrame"] {
-                background: rgba(15, 23, 42, 0.85) !important;
-                border-radius: 18px !important;
-            }
-            .stTextInput input, .stTextArea textarea, div[data-baseweb="select"] > div {
-                background: rgba(15, 23, 42, 0.92) !important;
-                color: #f8fafc !important;
-                border-color: rgba(148, 163, 184, 0.35) !important;
-            }
-        </style>
-        """
+def render_message(role: str, content: str) -> None:
+    if role == "user":
+        st.markdown(
+            f"""
+            <div class="user-row">
+                <div class="msg-bubble">{safe_text(content)}</div>
+                <div class="avatar-user">👤</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
     else:
-        css = """
-        <style>
-            .stApp {
-                background:
-                    radial-gradient(circle at top left, rgba(37, 99, 235, 0.10), transparent 32%),
-                    radial-gradient(circle at top right, rgba(16, 185, 129, 0.10), transparent 30%),
-                    linear-gradient(180deg, #f8fafc 0%, #eef2f7 100%) !important;
-            }
-        </style>
-        """
-
-    responsive_css = """
-    <style>
-        .theme-corner {
-            display: flex;
-            justify-content: flex-end;
-            margin-bottom: 0.35rem;
-        }
-        .suggestion-chip-row {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 8px;
-            margin: 0.4rem 0 0.8rem 0;
-        }
-        .mini-note {
-            font-size: 0.82rem;
-            color: #64748b;
-            line-height: 1.45;
-        }
-        @media (max-width: 1100px) {
-            .block-container { padding-left: 1rem !important; padding-right: 1rem !important; }
-            .hero { padding: 26px 24px !important; border-radius: 24px !important; }
-            .hero h1 { font-size: 34px !important; }
-            .hero p { font-size: 15px !important; }
-            .glass-card, .ops-grid-card, .chat-wrap, .case-card, .queue-card, .intel-card, .kpi-card { padding: 18px !important; border-radius: 22px !important; }
-        }
-        @media (max-width: 760px) {
-            section[data-testid="stSidebar"] { min-width: 230px !important; }
-            .block-container { padding-top: 0.8rem !important; padding-left: 0.7rem !important; padding-right: 0.7rem !important; }
-            .hero { padding: 22px 18px !important; border-radius: 20px !important; margin-bottom: 14px !important; }
-            .hero h1 { font-size: 27px !important; letter-spacing: -0.02em !important; }
-            .hero p { font-size: 14px !important; }
-            .section-title, .ops-card-title { font-size: 18px !important; }
-            .kpi-value { font-size: 26px !important; }
-            .badge { font-size: 11px !important; padding: 5px 9px !important; }
-            .emotion-strip { overflow-x: auto !important; flex-wrap: nowrap !important; padding-bottom: 8px !important; }
-            .emotion-node { min-width: 155px !important; }
-            .arrow-node { min-width: 24px !important; }
-            div[data-testid="stDataFrame"] { overflow-x: auto !important; }
-        }
-    </style>
-    """
-    st.markdown(css + responsive_css, unsafe_allow_html=True)
+        st.markdown(
+            f"""
+            <div class="bot-row">
+                <div class="avatar-bot">🎧</div>
+                <div class="msg-bubble">{safe_text(content)}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
 
 # ============================================================
-# Secrets and Optional Clients
+# Secrets and optional clients/models
 # ============================================================
 
 def get_secret_value(name: str, default: str = "") -> str:
     try:
         value = st.secrets.get(name, default)
     except Exception:
+        value = default
+    if value == default or value == "":
         value = os.getenv(name, default)
-
-    if value is None:
-        return default
     return str(value)
 
 
 @st.cache_resource(show_spinner=False)
 def get_gemini_client():
+    if genai is None:
+        return None
     api_key = get_secret_value("GEMINI_API_KEY", "")
-    if api_key == "" or genai is None:
+    if api_key == "":
         return None
     return genai.Client(api_key=api_key)
 
 
-def get_gemini_model_name() -> str:
-    return get_secret_value("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
-
-
-def transformers_enabled() -> bool:
-    return get_secret_value("ENABLE_TRANSFORMERS", "false").lower() == "true"
-
-
-@st.cache_resource(show_spinner="Loading optional emotion model...")
-def load_emotion_pipeline():
-    # Optional dependency. Do not put transformers/torch in requirements unless you enable this.
-    from transformers import pipeline
-    model_name = get_secret_value("EMOTION_MODEL", "j-hartmann/emotion-english-distilroberta-base")
-    return pipeline("text-classification", model=model_name, top_k=None)
+@st.cache_resource(show_spinner=False)
+def get_transformer_emotion_model():
+    enabled = get_secret_value("ENABLE_TRANSFORMERS", "false").lower() == "true"
+    if not enabled:
+        return None
+    try:
+        from transformers import pipeline
+        model_name = get_secret_value("EMOTION_MODEL", "j-hartmann/emotion-english-distilroberta-base")
+        return pipeline("text-classification", model=model_name, top_k=None)
+    except Exception:
+        return None
 
 
 # ============================================================
 # Storage
 # ============================================================
 
-def load_records() -> List[Dict]:
+def load_records() -> List[Dict[str, Any]]:
     if not os.path.exists(DATA_FILE):
         return []
-
     try:
         df = pd.read_csv(DATA_FILE)
         if df.empty:
@@ -520,17 +486,20 @@ def load_records() -> List[Dict]:
         for col in EXPECTED_COLUMNS:
             if col not in df.columns:
                 df[col] = ""
-        return df[EXPECTED_COLUMNS].to_dict("records")
+        df = df[EXPECTED_COLUMNS]
+        df = df.fillna("")
+        return df.to_dict("records")
     except Exception:
         return []
 
 
-def save_records(records: List[Dict]) -> None:
+def save_records(records: List[Dict[str, Any]]) -> None:
     df = pd.DataFrame(records)
     for col in EXPECTED_COLUMNS:
         if col not in df.columns:
             df[col] = ""
-    df[EXPECTED_COLUMNS].to_csv(DATA_FILE, index=False)
+    df = df[EXPECTED_COLUMNS].fillna("")
+    df.to_csv(DATA_FILE, index=False)
 
 
 def clear_records_file() -> None:
@@ -538,151 +507,142 @@ def clear_records_file() -> None:
         os.remove(DATA_FILE)
 
 
-def prepare_dataframe(records: List[Dict]) -> pd.DataFrame:
+def prepare_dataframe(records: List[Dict[str, Any]]) -> pd.DataFrame:
     df = pd.DataFrame(records)
     for col in EXPECTED_COLUMNS:
         if col not in df.columns:
             df[col] = ""
+    df = df[EXPECTED_COLUMNS].fillna("")
     if len(df) > 0:
         df["risk_score"] = pd.to_numeric(df["risk_score"], errors="coerce").fillna(0).astype(int)
-    return df[EXPECTED_COLUMNS]
-
-
-def create_case_id() -> str:
-    return "CASE-" + datetime.now().strftime("%Y%m%d%H%M%S%f")[-14:]
-
-
-def update_case_record(case_id: str, updates: Dict) -> None:
-    records = load_records()
-    for record in records:
-        if str(record.get("case_id", "")) == str(case_id):
-            for key, value in updates.items():
-                record[key] = value
-            record["last_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            break
-    save_records(records)
-    st.session_state.records = records
+    return df
 
 
 # ============================================================
-# Text, Topic, Emotion, Sarcasm, Risk
+# Intent/tone/topic detection
 # ============================================================
 
-def clean_text(text: str) -> str:
-    text = str(text).lower()
-    text = re.sub(r"http\S+|www\S+", "", text)
-    text = re.sub(r"@\w+", "", text)
-    text = re.sub(r"#", "", text)
-    text = re.sub(r"[^a-zA-Z0-9\s]", "", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+def is_greeting(text: str) -> bool:
+    t = clean_text(text)
+    greetings = {
+        "hi", "hai", "hello", "hey", "hii", "hiii", "good morning",
+        "good afternoon", "good evening", "yo", "hola"
+    }
+    return t in greetings or (len(t.split()) <= 3 and any(g in t.split() for g in ["hi", "hai", "hello", "hey"]))
 
 
-def detect_topic_rule(text: str, selected_issue_type: str = "Not sure yet", chat_history: Optional[List[Dict]] = None) -> str:
-    """
-    Detect the topic from the current message and recent chat context.
-    The issue-type dropdown is only a weak hint; it should not override clear
-    intent from the customer message or conversation.
-    """
-    t = str(text).lower().strip()
-    words = t.split()
+def is_thanks(text: str) -> bool:
+    t = clean_text(text)
+    return t in ["thanks", "thank you", "ok thanks", "okay thanks", "thank u", "ty"]
 
-    # Strong delivery/order-status patterns must be checked before generic
-    # product words. Customers often say "where is my product" when they mean
-    # delivery/tracking, not product quality.
-    delivery_phrases = [
-        "where is my product", "where is my item", "where is my order",
-        "where is my package", "where is my parcel", "missing package",
-        "missing parcel", "package missing", "product missing",
-        "not received", "did not receive", "haven't received", "have not received",
-        "when will it arrive", "when arrive", "arrival date", "possible date",
-        "expected date", "delivery date", "eta", "tracking", "shipment",
-        "shipping", "delayed", "delay", "late delivery", "out for delivery"
+
+def is_rude(text: str) -> bool:
+    t = clean_text(text)
+    rude_words = [
+        "fuck", "fuck off", "shit", "asshole", "idiot", "stupid", "useless",
+        "dumb", "nonsense", "bullshit", "bloody", "trash"
     ]
-    if any(p in t for p in delivery_phrases):
+    return any(word in t for word in rude_words)
+
+
+def is_manager_escalation_request(text: str) -> bool:
+    t = clean_text(text)
+    phrases = [
+        "manager", "supervisor", "human agent", "real person", "talk to someone",
+        "speak to someone", "talk with your manager", "talk to your manager",
+        "connect me", "escalate", "higher authority", "senior support",
+        "live agent", "customer care head"
+    ]
+    return any(phrase in t for phrase in phrases)
+
+
+def is_reference_info(text: str) -> bool:
+    t = str(text).strip()
+    if len(t) > 30:
+        return False
+    patterns = [
+        r"^[A-Za-z]{2,5}\d{2,}$",
+        r"^\d{4,}$",
+        r"^(ord|order|ref|case)[\s\-#]*[A-Za-z0-9\-]+$",
+    ]
+    return any(re.match(p, t, flags=re.IGNORECASE) for p in patterns)
+
+
+def is_eta_request(text: str) -> bool:
+    t = clean_text(text)
+    phrases = [
+        "possible date", "delivery date", "expected date", "when will", "when can",
+        "how long", "eta", "arrival date", "arrive", "come", "deliver"
+    ]
+    return any(p in t for p in phrases)
+
+
+def detect_sarcasm(text: str) -> Tuple[bool, str]:
+    t = clean_text(text)
+    positive_words = ["great", "amazing", "wonderful", "fantastic", "perfect", "excellent", "lovely", "nice"]
+    negative_context = [
+        "late", "delayed", "ignored", "broken", "damaged", "charged", "refund",
+        "wrong", "missing", "crash", "error", "cancelled", "nothing", "still no", "again"
+    ]
+    if any(p in t for p in positive_words) and any(n in t for n in negative_context):
+        return True, "Positive words used with negative complaint context."
+    return False, "No sarcasm detected."
+
+
+def detect_topic(text: str, selected_hint: str = "Not sure yet", active_topic: str = "") -> str:
+    t = clean_text(text)
+
+    # Follow-up context first
+    if is_eta_request(text) and active_topic == "Delivery Issue":
+        return "Delivery Issue"
+    if is_reference_info(text) and active_topic:
+        return active_topic
+
+    # Delivery / tracking
+    delivery_patterns = [
+        "package", "parcel", "shipment", "shipping", "delivery", "delivered", "late", "delay",
+        "delayed", "not received", "missing", "where is", "tracking", "track", "arrive",
+        "arrival", "order status", "my product", "where my product", "where is my product"
+    ]
+    if any(p in t for p in delivery_patterns):
         return "Delivery Issue"
 
-    if any(p in t for p in ["refund", "money back", "return my money", "chargeback"]):
+    if any(p in t for p in ["refund", "money back", "return my money", "cashback", "chargeback"]):
         return "Refund Issue"
 
-    if any(p in t for p in ["charged", "payment", "billing", "bill", "invoice", "paid", "card", "transaction", "charged twice"]):
+    if any(p in t for p in ["charged", "charged twice", "payment", "billing", "bill", "invoice", "paid", "card", "transaction"]):
         return "Billing Issue"
 
-    if any(p in t for p in ["broken", "damaged", "defective", "faulty", "quality", "wrong item", "replacement", "not working product"]):
+    if any(p in t for p in ["broken", "damaged", "defective", "faulty", "quality", "wrong item", "wrong product", "replacement"]):
         return "Product Issue"
 
-    if any(p in t for p in ["support", "customer service", "agent", "no reply", "ignored", "nobody helped", "rude", "no one helped"]):
-        return "Customer Service Issue"
-
-    if any(p in t for p in ["app", "website", "login", "password", "error", "crash", "bug", "reset link", "technical", "otp"]):
+    if any(p in t for p in ["login", "password", "app", "website", "error", "crash", "bug", "not working", "technical"]):
         return "Technical Issue"
 
-    # Short follow-up questions should inherit the previous conversation topic
-    # instead of being forced by the dropdown.
-    if len(words) <= 5:
-        context_topic = infer_topic_from_history(chat_history)
-        if context_topic != "General Complaint":
-            return context_topic
-
-    if selected_issue_type and selected_issue_type != "Not sure yet" and len(words) > 5:
-        return selected_issue_type
-
-    return "General Complaint"
-
-
-def infer_topic_from_history(chat_history: Optional[List[Dict]]) -> str:
-    """Infer the current issue topic from recent customer messages."""
-    if not chat_history:
-        return "General Complaint"
-    recent_user_text = " ".join(
-        str(item.get("content", ""))
-        for item in chat_history[-8:]
-        if item.get("role") == "user"
-    ).lower()
-    # Avoid recursion by using direct patterns only.
-    if any(p in recent_user_text for p in ["where is", "package", "parcel", "order", "shipment", "shipping", "delivery", "tracking", "arrive", "delayed", "missing"]):
-        return "Delivery Issue"
-    if any(p in recent_user_text for p in ["refund", "money back", "return my money", "chargeback"]):
-        return "Refund Issue"
-    if any(p in recent_user_text for p in ["charged", "payment", "billing", "invoice", "card", "paid"]):
-        return "Billing Issue"
-    if any(p in recent_user_text for p in ["broken", "damaged", "defective", "faulty", "wrong item", "replacement"]):
-        return "Product Issue"
-    if any(p in recent_user_text for p in ["login", "password", "app", "website", "error", "bug", "crash"]):
-        return "Technical Issue"
-    if any(p in recent_user_text for p in ["support", "agent", "no reply", "ignored", "nobody helped", "rude"]):
+    if any(p in t for p in ["support", "agent", "customer service", "no reply", "ignored", "nobody helped", "rude"]):
         return "Customer Service Issue"
-    return "General Complaint"
+
+    if is_manager_escalation_request(text):
+        return active_topic if active_topic else "Customer Service Issue"
+
+    if selected_hint and selected_hint != "Not sure yet" and not is_greeting(text):
+        return selected_hint
+
+    return active_topic if active_topic else "General Complaint"
 
 
-def detect_emotion_rule(text: str) -> str:
-    """
-    Fast fallback emotion detector.
-    This is intentionally stronger than a basic sentiment rule so manager metrics
-    do not stay Neutral for clear complaints such as refund, missing package,
-    billing problem, or profanity.
-    """
-    t = str(text).lower()
+def detect_emotion_rule(text: str, topic: str, sarcastic: bool, rude: bool, escalation: bool) -> str:
+    t = clean_text(text)
 
-    angry_words = [
-        "angry", "furious", "mad", "worst", "terrible", "awful", "hate",
-        "unacceptable", "ridiculous", "fuck", "shit", "damn", "useless",
-        "never buy", "scam", "fraud", "cheated", "asshole", "bastard", "fuck off"
-    ]
-    disappointed_words = [
-        "disappointed", "upset", "frustrated", "annoyed", "unhappy", "poor",
-        "bad experience", "not satisfied", "missing", "delayed", "late",
-        "refund", "money back", "charged", "billing", "broken", "damaged",
-        "wrong item", "not working", "no reply", "ignored", "nobody helped"
-    ]
-    confused_words = [
-        "confused", "unclear", "do not understand", "don't understand",
-        "why", "how", "what happened", "not sure", "where is", "cant find", "can't find", "possible date", "eta", "when arrive", "delivery date"
-    ]
-    satisfied_words = [
-        "thank", "thanks", "appreciate", "great", "good", "excellent",
-        "resolved", "solved", "happy", "helpful"
-    ]
+    if rude or escalation:
+        return "Angry"
+    if sarcastic:
+        return "Disappointed"
+
+    angry_words = ["angry", "furious", "mad", "worst", "terrible", "awful", "hate", "unacceptable", "ridiculous"]
+    disappointed_words = ["disappointed", "upset", "frustrated", "annoyed", "unhappy", "poor", "bad experience", "still waiting"]
+    confused_words = ["confused", "unclear", "do not understand", "don't understand", "why", "how", "what happened"]
+    positive_words = ["thanks", "thank you", "appreciate", "great", "good", "excellent", "resolved", "solved", "happy"]
 
     if any(w in t for w in angry_words):
         return "Angry"
@@ -690,22 +650,29 @@ def detect_emotion_rule(text: str) -> str:
         return "Disappointed"
     if any(w in t for w in confused_words):
         return "Confused"
-    if any(w in t for w in satisfied_words):
+    if any(w in t for w in positive_words) and topic == "General Complaint":
         return "Satisfied"
+
+    if topic in ["Refund Issue", "Billing Issue", "Customer Service Issue"]:
+        return "Disappointed"
+    if topic in ["Delivery Issue", "Product Issue", "Technical Issue"]:
+        return "Confused"
+
     return "Neutral"
 
 
-def detect_emotion_optional_transformer(text: str, fallback_emotion: str) -> Tuple[str, str]:
-    if not transformers_enabled():
-        return fallback_emotion, "rule"
+def detect_emotion_transformer(text: str) -> Tuple[str, float, str]:
+    model = get_transformer_emotion_model()
+    if model is None:
+        return "", 0.0, "not_enabled"
     try:
-        clf = load_emotion_pipeline()
-        results = clf(text)
-        if isinstance(results, list) and results and isinstance(results[0], list):
+        results = model(text)
+        if isinstance(results, list) and len(results) > 0 and isinstance(results[0], list):
             results = results[0]
         top = max(results, key=lambda x: x.get("score", 0))
-        raw = str(top.get("label", "neutral")).lower()
-        mapper = {
+        label = str(top.get("label", "neutral")).lower()
+        score = float(top.get("score", 0.0))
+        emotion_map = {
             "anger": "Angry",
             "disgust": "Angry",
             "fear": "Confused",
@@ -714,22 +681,25 @@ def detect_emotion_optional_transformer(text: str, fallback_emotion: str) -> Tup
             "sadness": "Disappointed",
             "surprise": "Confused",
         }
-        return mapper.get(raw, fallback_emotion), "transformer"
+        return emotion_map.get(label, "Neutral"), score, label
     except Exception:
-        return fallback_emotion, "rule"
+        return "", 0.0, "failed"
 
 
-def detect_sarcasm_rule(text: str) -> Tuple[bool, str]:
-    t = str(text).lower()
-    positive_words = ["great", "amazing", "wonderful", "perfect", "excellent", "fantastic", "nice"]
-    negative_context = ["late", "delayed", "broken", "damaged", "wrong", "charged", "refund", "nobody", "ignored", "not working", "worst"]
-    sarcasm_markers = ["yeah right", "thanks for nothing", "so helpful", "what a joke", "only", "again"]
-
-    if any(p in t for p in positive_words) and any(n in t for n in negative_context):
-        return True, "Positive wording appears with a negative complaint context."
-    if any(m in t for m in sarcasm_markers) and any(n in t for n in negative_context):
-        return True, "Message contains sarcasm markers with dissatisfaction."
-    return False, "No sarcasm pattern detected."
+def detect_tone(emotion: str, sarcastic: bool, rude: bool, escalation: bool) -> str:
+    if rude:
+        return "Rude"
+    if sarcastic:
+        return "Sarcastic"
+    if escalation:
+        return "Escalation Request"
+    if emotion == "Angry":
+        return "Angry"
+    if emotion == "Satisfied":
+        return "Positive"
+    if emotion == "Confused":
+        return "Confused"
+    return "Polite"
 
 
 def get_risk_level(score: int) -> str:
@@ -740,432 +710,193 @@ def get_risk_level(score: int) -> str:
     return "Low"
 
 
-def calculate_risk(emotion: str, topic: str, text: str, sarcastic: bool) -> Tuple[int, str]:
-    t = str(text).lower()
-    base_scores = {"Satisfied": 5, "Neutral": 15, "Confused": 30, "Disappointed": 45, "Angry": 75}
-    score = base_scores.get(emotion, 15)
+def calculate_risk(emotion: str, topic: str, text: str, sarcastic: bool, rude: bool, escalation: bool) -> Tuple[int, str]:
+    t = clean_text(text)
+    score_map = {
+        "Satisfied": 5,
+        "Neutral": 15,
+        "Confused": 30,
+        "Disappointed": 45,
+        "Angry": 70,
+    }
+    score = score_map.get(emotion, 15)
     reasons = [f"Base score from emotion: {emotion}."]
 
-    if any(w in t for w in ["refund", "money back", "chargeback"]):
+    if topic in ["Refund Issue", "Billing Issue"]:
         score += 10
-        reasons.append("Customer mentioned refund or money back.")
-    if any(w in t for w in ["cancel", "cancellation", "never buy", "unsubscribe"]):
+        reasons.append(f"{topic} is money-related.")
+    if topic == "Customer Service Issue":
+        score += 10
+        reasons.append("Customer service issue can escalate quickly.")
+    if topic == "Delivery Issue" and any(w in t for w in ["missing", "not received", "where is", "late", "delayed"]):
+        score += 10
+        reasons.append("Delivery issue suggests delay or missing item.")
+    if any(w in t for w in ["refund", "money back", "cancel", "cancellation", "never buy"]):
         score += 15
-        reasons.append("Customer may be considering cancellation or churn.")
-    if any(w in t for w in ["again", "still", "no reply", "nobody helped", "ignored", "waiting", "third time", "many times"]):
+        reasons.append("Customer mentioned refund/cancellation risk.")
+    if any(w in t for w in ["again", "still", "no reply", "ignored", "nobody helped", "waiting"]):
         score += 10
-        reasons.append("Message suggests repeated or unresolved support problems.")
-    if topic in ["Refund Issue", "Billing Issue", "Customer Service Issue"]:
-        score += 5
-        reasons.append(f"{topic} is a sensitive complaint category.")
+        reasons.append("Message suggests repeated or unresolved issue.")
     if sarcastic:
         score += 10
-        reasons.append("Sarcasm or indirect dissatisfaction detected.")
+        reasons.append("Sarcastic tone indicates hidden dissatisfaction.")
+    if rude:
+        score += 15
+        reasons.append("Rude/abusive tone indicates high frustration.")
+    if escalation:
+        score += 15
+        reasons.append("Customer requested manager/human escalation.")
 
     score = max(0, min(score, 100))
     return score, " ".join(reasons)
 
 
-# ============================================================
-# Dynamic Reply Generator
-# ============================================================
+def generate_customer_reply(text: str, topic: str, active_topic: str, rude: bool, escalation: bool, reference: bool, eta: bool) -> str:
+    if is_greeting(text):
+        return "Hi! I’m here to help. You can tell me about a delivery, refund, billing, product, technical, or support issue."
 
-def is_abusive_only(message: str) -> bool:
-    """True when the message is only abuse/profanity and no actual issue details."""
-    t = clean_text(message)
-    abusive_only = {
-        "fuck", "fuck you", "fuck off", "shit", "damn", "stupid",
-        "idiot", "asshole", "bastard", "moron", "nonsense"
-    }
-    return t in abusive_only
+    if is_thanks(text):
+        return "You’re welcome. I’m here if you need any more help."
 
-
-def get_smalltalk_reply(message: str) -> Optional[str]:
-    """
-    Handle greetings and thanks before case creation.
-    These messages should not create a support case.
-    """
-    t = clean_text(message)
-
-    greetings = {
-        "hi", "hai", "hello", "hey", "hii", "helo", "good morning",
-        "good afternoon", "good evening", "yo"
-    }
-    thanks = {"thanks", "thank you", "thankyou", "ty", "ok thanks", "okay thanks"}
-    bye = {"bye", "goodbye", "see you", "thank you bye", "thanks bye"}
-
-    if t in greetings:
+    if escalation:
         return (
-            "Hi! I’m here to help. Tell me what happened, or choose an issue type like "
-            "delivery, refund, billing, product, technical, or support."
+            "I understand that you want manager support. I’ve marked your case for manager review "
+            "so a manager or senior support team member can review the issue."
         )
 
-    if t in thanks:
-        return "You’re welcome. Send any extra details here if you want the team to review them."
+    if rude and topic == "General Complaint" and not active_topic:
+        return (
+            "I understand you’re upset. I’m here to help, but please describe the issue so I can record it properly for our team."
+        )
 
-    if t in bye:
-        return "Thank you for contacting support. Have a good day."
+    if reference:
+        return "Thank you. I’ve added that reference to your case so the team can use it while reviewing your issue."
 
-    return None
+    if eta and (active_topic == "Delivery Issue" or topic == "Delivery Issue"):
+        return (
+            "I understand you want the expected delivery date. I’ve updated your delivery case so the team can check the shipment status and next possible update."
+        )
+
+    if topic == "Delivery Issue":
+        return (
+            "I’m sorry about the delivery problem. I’ve recorded this as a delivery issue so the team can check the shipment status, delay reason, and next update."
+        )
+    if topic == "Refund Issue":
+        return (
+            "I understand your refund concern. I’ve recorded your request so the team can review the order and follow up with the next steps."
+        )
+    if topic == "Billing Issue":
+        return (
+            "Thank you for reporting the billing concern. I’ve recorded it so the team can review the payment or invoice details carefully."
+        )
+    if topic == "Product Issue":
+        return (
+            "I’m sorry about the product issue. I’ve recorded it so the team can review the item condition and possible replacement or support options."
+        )
+    if topic == "Technical Issue":
+        return (
+            "Thank you for reporting the technical issue. I’ve recorded the problem so the team can review it and work on the next steps."
+        )
+    if topic == "Customer Service Issue":
+        return (
+            "I’m sorry the support experience has not been helpful. I’ve recorded this so the team can review the service issue and follow up properly."
+        )
+
+    return "Thanks. Could you describe what happened in a little more detail so I can record the issue properly?"
 
 
-def looks_like_reference(text: str) -> bool:
-    value = str(text).strip()
-    if len(value) < 3 or len(value) > 30:
+def is_actionable_message(text: str, topic: str, active_case_id: str, rude: bool, escalation: bool, reference: bool, eta: bool) -> bool:
+    if is_greeting(text) or is_thanks(text):
         return False
-    return bool(re.search(r"[A-Za-z].*\d|\d.*[A-Za-z]", value)) or value.isdigit()
-
-
-def build_customer_reply(
-    message: str,
-    topic: str,
-    risk_level: str,
-    emotion: str,
-    selected_issue_type: str,
-    chat_history: Optional[List[Dict]] = None,
-) -> str:
-    """Create a customer-facing reply that is specific to the current message and context."""
-    raw = str(message).strip()
-    t = raw.lower()
-    short = len(raw.split()) <= 5
-    context_topic = infer_topic_from_history(chat_history)
-    effective_topic = topic if topic != "General Complaint" else context_topic
-
-    if looks_like_reference(raw):
-        return (
-            f"Thank you. I’ve added reference **{raw}** to your support case. "
-            "Our team can use it to review the issue more accurately."
-        )
-
-    # Context-aware follow-up replies.
-    eta_words = ["possible date", "date", "when", "arrive", "arrival", "eta", "expected"]
-    if any(w in t for w in eta_words) and effective_topic == "Delivery Issue":
-        return (
-            "I understand you want the expected delivery date. I can’t see live tracking from here, "
-            "but I’ve added your request for an ETA to the case so the team can check the shipment status and update you."
-        )
-
-    if any(w in t for w in ["status", "update", "any update", "what happened"]) and effective_topic != "General Complaint":
-        return (
-            "I’ve added your request for an update to the support case. "
-            "The team will review the latest details and follow up with the next step."
-        )
-
-    # If the customer is upset but has already given an issue, de-escalate and confirm the case.
-    angry_prefix = "I’m sorry for the frustrating experience. " if risk_level == "High" or emotion == "Angry" else ""
-
-    if effective_topic == "Delivery Issue":
-        if any(p in t for p in ["where is", "missing", "not received", "haven't received", "have not received"]):
-            return angry_prefix + (
-                "I’ve recorded this as a missing or delayed delivery issue. "
-                "The team can check the shipment status, tracking details, and next update."
-            )
-        return angry_prefix + (
-            "I’ve recorded this as a delivery issue so the team can check the shipment status, delay reason, and next update."
-        )
-
-    if effective_topic == "Refund Issue":
-        return angry_prefix + (
-            "I’ve recorded your refund concern so the team can review the order and follow up with the next steps."
-        )
-
-    if effective_topic == "Billing Issue":
-        return angry_prefix + (
-            "I’ve recorded this billing concern so the team can review the charge or payment details carefully."
-        )
-
-    if effective_topic == "Product Issue":
-        return angry_prefix + (
-            "I’ve recorded this product issue so the team can review the item condition and possible replacement or support options."
-        )
-
-    if effective_topic == "Technical Issue":
-        return angry_prefix + (
-            "I’ve recorded this technical issue so the team can review the error and check what is causing the problem."
-        )
-
-    if effective_topic == "Customer Service Issue":
-        return angry_prefix + (
-            "I’ve recorded this as a support experience issue so the team can review the previous response and follow up properly."
-        )
-
-    # Do not create vague robotic replies for very short unclear messages.
-    if short:
-        return (
-            "I can help with that. Could you tell me what happened and whether it is about delivery, refund, billing, product, technical, or support?"
-        )
-
-    if "thank" in t or "thanks" in t:
-        return "Thank you for sharing that. I’ve recorded your feedback for the team."
-
-    return (
-        "Thank you for explaining. I’ve recorded your message as a support case so our team can review it."
-    )
-
+    if escalation:
+        return True
+    if topic != "General Complaint":
+        return True
+    if active_case_id and (rude or reference or eta):
+        return True
+    if rude and not active_case_id:
+        return False
+    return False
 
 
 # ============================================================
-# Gemini Manager Analysis Optional
+# Optional Gemini manager analysis
 # ============================================================
 
-def extract_json(text: str) -> Dict:
-    cleaned = str(text).strip().replace("```json", "").replace("```", "").strip()
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
+def extract_json(text: str) -> Dict[str, Any]:
+    text = str(text).strip()
+    if text.startswith("```"):
+        text = text.replace("```json", "").replace("```", "").strip()
+    start = text.find("{")
+    end = text.rfind("}")
     if start != -1 and end != -1:
-        cleaned = cleaned[start:end + 1]
-    return json.loads(cleaned)
+        text = text[start:end + 1]
+    return json.loads(text)
 
 
-def analyze_with_gemini(message: str, topic_hint: str, chat_history: Optional[List[Dict]]) -> Optional[Dict]:
+def gemini_private_analysis(message: str, conversation: str) -> Dict[str, str]:
     client = get_gemini_client()
     if client is None:
-        return None
-
-    history_text = ""
-    if chat_history:
-        for item in chat_history[-8:]:
-            history_text += f"{item.get('role', '')}: {item.get('content', '')}\n"
+        return {}
 
     prompt = f"""
-You are a private customer-support intelligence analyst.
-Analyze the latest customer message and recent chat context.
-Return only valid JSON with this exact structure:
+You are a private customer support intelligence analyst.
+Analyze the latest customer message and recent conversation.
+Return only valid JSON, no markdown.
+
+Required JSON:
 {{
-  "emotion": "Angry | Confused | Disappointed | Satisfied | Neutral",
-  "complaint_topic": "Refund Issue | Delivery Issue | Billing Issue | Product Issue | Customer Service Issue | Technical Issue | General Complaint",
-  "customer_intent": "short internal explanation",
-  "business_risk": "short internal business risk",
-  "risk_score": 0,
-  "risk_reason": "short internal reason",
+  "customer_intent": "short intent",
+  "business_risk": "short business risk",
   "recommended_action": "short manager action"
 }}
 
-Topic hint from UI/rules: {topic_hint}
-Recent chat:
-{history_text}
-Latest customer message:
-{message!r}
+Conversation:
+{conversation}
+
+Latest message:
+{message}
 """
     try:
-        response = client.models.generate_content(
-            model=get_gemini_model_name(),
-            contents=prompt,
-            config={"temperature": 0.15, "response_mime_type": "application/json"},
-        )
+        if types is not None:
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(temperature=0.2, response_mime_type="application/json"),
+            )
+        else:
+            response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
         if not response.text:
-            return None
-        result = extract_json(response.text)
-        return result
+            return {}
+        return extract_json(response.text)
     except Exception:
-        return None
-
-
-def normalize_analysis(result: Dict, fallback: Dict) -> Dict:
-    allowed_emotions = ["Angry", "Confused", "Disappointed", "Satisfied", "Neutral"]
-    allowed_topics = ["Refund Issue", "Delivery Issue", "Billing Issue", "Product Issue", "Customer Service Issue", "Technical Issue", "General Complaint"]
-
-    emotion = str(result.get("emotion", fallback["emotion"]))
-    topic = str(result.get("complaint_topic", fallback["complaint_topic"]))
-    if emotion not in allowed_emotions:
-        emotion = fallback["emotion"]
-    if topic not in allowed_topics:
-        topic = fallback["complaint_topic"]
-
-    # Do not let Gemini downgrade clear complaint signals to Neutral.
-    if fallback.get("emotion") in ["Angry", "Disappointed", "Confused"] and emotion == "Neutral":
-        emotion = fallback["emotion"]
-
-    try:
-        risk_score = int(result.get("risk_score", fallback["risk_score"]))
-    except Exception:
-        risk_score = fallback["risk_score"]
-
-    # Do not let Gemini reduce a locally detected risk signal.
-    risk_score = max(risk_score, int(fallback.get("risk_score", 0)))
-    risk_score = max(0, min(risk_score, 100))
-
-    return {
-        **fallback,
-        "emotion": emotion,
-        "complaint_topic": topic,
-        "risk_score": risk_score,
-        "risk_level": get_risk_level(risk_score),
-        "customer_intent": str(result.get("customer_intent", fallback["customer_intent"])),
-        "business_risk": str(result.get("business_risk", fallback["business_risk"])),
-        "risk_reason": str(result.get("risk_reason", fallback["risk_reason"])),
-        "recommended_action": str(result.get("recommended_action", fallback["recommended_action"])),
-        "analysis_source": "Gemini + local reply",
-    }
-
-
-def analyze_feedback(message: str, selected_issue_type: str, chat_history: Optional[List[Dict]]) -> Dict:
-    cleaned = clean_text(message)
-
-    smalltalk_reply = get_smalltalk_reply(message)
-    if smalltalk_reply is not None:
-        return {
-            "clean_text": cleaned,
-            "analysis_source": "Small talk handler",
-            "emotion": "Neutral",
-            "sarcasm_detected": "No",
-            "sarcasm_reason": "Small-talk message; no complaint detected.",
-            "complaint_topic": "General Complaint",
-            "customer_intent": "Customer is greeting or using small talk.",
-            "business_risk": "No business risk detected because no issue was described.",
-            "risk_score": 0,
-            "risk_level": "Low",
-            "risk_reason": "Greeting or small-talk message only.",
-            "recommended_action": "No manager action needed unless the customer describes an issue.",
-            "customer_reply": smalltalk_reply,
-            "actionable_case": False,
-        }
-
-    if is_abusive_only(message):
-        context_topic = infer_topic_from_history(chat_history)
-        if context_topic != "General Complaint":
-            return {
-                "clean_text": cleaned,
-                "analysis_source": "Abuse/context handler",
-                "emotion": "Angry",
-                "sarcasm_detected": "No",
-                "sarcasm_reason": "No sarcasm pattern detected.",
-                "complaint_topic": context_topic,
-                "customer_intent": "Customer is angry and wants the existing issue handled urgently.",
-                "business_risk": "High escalation risk because the customer is using abusive language after reporting an issue.",
-                "risk_score": 88,
-                "risk_level": "High",
-                "risk_reason": "Abusive language detected in an existing support context.",
-                "recommended_action": "Manager or support lead should review and follow up quickly.",
-                "customer_reply": "I’m sorry you’re upset. I’ve updated your existing case as urgent so the team can review it more carefully.",
-                "actionable_case": True,
-            }
-        return {
-            "clean_text": cleaned,
-            "analysis_source": "Abuse handler",
-            "emotion": "Angry",
-            "sarcasm_detected": "No",
-            "sarcasm_reason": "No sarcasm pattern detected.",
-            "complaint_topic": "General Complaint",
-            "customer_intent": "Customer is upset but has not described the issue yet.",
-            "business_risk": "No actionable issue yet, but customer tone is negative.",
-            "risk_score": 0,
-            "risk_level": "Low",
-            "risk_reason": "Abusive-only message without issue details.",
-            "recommended_action": "No manager action needed unless the customer describes the issue.",
-            "customer_reply": "I’m sorry you’re upset. I can help record the problem for our team, but I need a little detail about what went wrong.",
-            "actionable_case": False,
-        }
-
-    topic = detect_topic_rule(cleaned, selected_issue_type, chat_history)
-    emotion_rule = detect_emotion_rule(cleaned)
-    emotion, emotion_source = detect_emotion_optional_transformer(message, emotion_rule)
-    sarcastic, sarcasm_reason = detect_sarcasm_rule(message)
-    risk_score, risk_reason = calculate_risk(emotion, topic, cleaned, sarcastic)
-    risk_level = get_risk_level(risk_score)
-
-    fallback = {
-        "clean_text": cleaned,
-        "analysis_source": f"Local rules ({emotion_source})",
-        "emotion": emotion,
-        "sarcasm_detected": "Yes" if sarcastic else "No",
-        "sarcasm_reason": sarcasm_reason,
-        "complaint_topic": topic,
-        "customer_intent": "Customer wants the issue reviewed and resolved.",
-        "business_risk": "Customer satisfaction may decrease if the issue is not handled promptly.",
-        "risk_score": risk_score,
-        "risk_level": risk_level,
-        "risk_reason": risk_reason,
-        "recommended_action": "Review the case, assign the correct team, and follow up if the risk is medium or high.",
-        "actionable_case": True,
-    }
-
-    gemini_result = analyze_with_gemini(message, topic, chat_history)
-    analysis = normalize_analysis(gemini_result, fallback) if gemini_result else fallback
-
-    # Always generate the customer reply locally for consistency and speed.
-    analysis["customer_reply"] = build_customer_reply(
-        message=message,
-        topic=analysis["complaint_topic"],
-        risk_level=analysis["risk_level"],
-        emotion=analysis["emotion"],
-        selected_issue_type=selected_issue_type,
-        chat_history=chat_history,
-    )
-    return analysis
-
-
-def build_coupon_message(record: Dict) -> str:
-    """Message a manager can copy after approving a recovery coupon."""
-    code = str(record.get("coupon_code", "")).strip()
-    offer = str(record.get("coupon_offer", "customer recovery offer")).strip()
-    topic = str(record.get("complaint_topic", "your recent issue")).lower()
-
-    if not code:
-        return "No coupon code is available for this case."
-
-    return (
-        f"We’re sorry for the inconvenience with {topic}. "
-        f"As a goodwill gesture, we’d like to offer you {offer}. "
-        f"You can use this coupon code on your next order: {code}."
-    )
-
-
-def reanalyze_existing_records() -> int:
-    """Re-run local/Gemini analysis for existing demo rows after rule/model changes."""
-    records = load_records()
-    updated_count = 0
-
-    for record in records:
-        message = str(record.get("message", "")).strip()
-        if not message:
-            continue
-
-        conversation = str(record.get("conversation", ""))
-        fake_history = [{"role": "user", "content": conversation or message}]
-        analysis = analyze_feedback(message, "Not sure yet", fake_history)
-        coupon = suggest_recovery_coupon(
-            analysis["risk_level"],
-            analysis["risk_score"],
-            analysis["complaint_topic"],
-            str(record.get("case_id", create_case_id()))
-        )
-
-        for key in [
-            "clean_text", "analysis_source", "emotion", "sarcasm_detected",
-            "sarcasm_reason", "complaint_topic", "customer_intent", "business_risk",
-            "risk_score", "risk_level", "risk_reason", "recommended_action", "customer_reply"
-        ]:
-            record[key] = analysis[key]
-
-        if str(record.get("coupon_status", "")) not in ["Approved", "Sent", "Rejected"]:
-            record["coupon_offer"] = coupon["coupon_offer"]
-            record["coupon_code"] = coupon["coupon_code"]
-            record["coupon_status"] = coupon["coupon_status"]
-            record["coupon_reason"] = coupon["coupon_reason"]
-
-        record["last_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        updated_count += 1
-
-    save_records(records)
-    st.session_state.records = records
-    return updated_count
+        return {}
 
 
 # ============================================================
-# Conversation and Case Helpers
+# Case lifecycle
 # ============================================================
 
-def format_conversation(chat_messages: List[Dict]) -> str:
+def format_conversation(messages: List[Dict[str, str]]) -> str:
     lines = []
-    for msg in chat_messages:
-        role = msg.get("role", "")
-        content = msg.get("content", "")
+    for m in messages:
+        role = m.get("role", "")
+        content = m.get("content", "")
         if role == "user":
             lines.append(f"Customer: {content}")
         elif role == "assistant":
             lines.append(f"Assistant: {content}")
     return "\n\n".join(lines)
+
+
+def get_active_topic() -> str:
+    if st.session_state.active_case_id == "":
+        return ""
+    records = load_records()
+    for r in records:
+        if str(r.get("case_id", "")) == st.session_state.active_case_id:
+            return str(r.get("complaint_topic", ""))
+    return ""
 
 
 def get_active_case_id() -> str:
@@ -1174,82 +905,195 @@ def get_active_case_id() -> str:
     return st.session_state.active_case_id
 
 
-def generate_coupon_code(case_id: str, discount_percent: int) -> str:
-    short_id = str(case_id).replace("CASE-", "")[-6:]
-    return f"VOC-{short_id}-{discount_percent}"
-
-
-def suggest_recovery_coupon(risk_level: str, risk_score: int, complaint_topic: str, case_id: str) -> Dict:
+def suggest_recovery_coupon(risk_level: str, risk_score: int, topic: str, case_id: str) -> Dict[str, str]:
     risk_score = int(risk_score)
+    short_id = str(case_id).replace("CASE-", "")[-6:]
+
     if risk_level == "High":
         discount = 20 if risk_score >= 85 else 15
-        if complaint_topic in ["Refund Issue", "Billing Issue"]:
+        if topic in ["Refund Issue", "Billing Issue"]:
             offer = f"{discount}% goodwill coupon after billing/refund review"
-            reason = "High-risk money-related complaint. Manager should review before offering compensation."
-        elif complaint_topic == "Delivery Issue":
-            offer = f"{discount}% apology coupon or free shipping recovery offer"
-            reason = "High-risk delivery issue. Recovery offer may help rebuild trust."
+            reason = "High-risk money-related complaint. Coupon should be manager-approved only after review."
+        elif topic == "Delivery Issue":
+            offer = f"{discount}% apology coupon or free-shipping recovery offer"
+            reason = "High-risk delivery issue. Coupon may help recover customer trust."
+        elif topic == "Product Issue":
+            offer = f"{discount}% product recovery coupon"
+            reason = "High-risk product issue. Coupon may help reduce churn after support action."
         else:
             offer = f"{discount}% customer recovery coupon"
-            reason = "High-risk dissatisfaction. Recovery offer may reduce escalation risk."
-        return {"coupon_offer": offer, "coupon_code": generate_coupon_code(case_id, discount), "coupon_status": "Suggested", "coupon_reason": reason}
+            reason = "High-risk dissatisfaction. Coupon may help reduce escalation risk."
+        return {
+            "coupon_offer": offer,
+            "coupon_code": f"REC-{short_id}-{discount}",
+            "coupon_status": "Suggested",
+            "coupon_reason": reason,
+        }
 
     if risk_level == "Medium":
         return {
-            "coupon_offer": "10% goodwill coupon if issue remains unresolved",
-            "coupon_code": generate_coupon_code(case_id, 10),
+            "coupon_offer": "10% goodwill coupon if unresolved",
+            "coupon_code": f"REC-{short_id}-10",
             "coupon_status": "Optional",
-            "coupon_reason": "Medium-risk case. Coupon is optional if resolution is delayed.",
+            "coupon_reason": "Medium-risk case. Coupon is optional if follow-up is delayed.",
         }
 
-    return {"coupon_offer": "No coupon needed", "coupon_code": "", "coupon_status": "Not Required", "coupon_reason": "Low-risk case. Normal support is enough."}
+    return {
+        "coupon_offer": "No coupon needed",
+        "coupon_code": "",
+        "coupon_status": "Not Required",
+        "coupon_reason": "Low-risk case. Normal support process is enough.",
+    }
 
 
-def create_or_update_active_case(customer_id: str, user_message: str, analysis: Dict, coupon: Dict) -> str:
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    case_id = get_active_case_id()
+def analyze_message(message: str, selected_hint: str, active_topic: str) -> Dict[str, Any]:
+    cleaned = clean_text(message)
+    rude = is_rude(message)
+    escalation = is_manager_escalation_request(message)
+    reference = is_reference_info(message)
+    eta = is_eta_request(message)
+    sarcastic, sarcasm_reason = detect_sarcasm(message)
+
+    topic = detect_topic(message, selected_hint, active_topic)
+
+    transformer_emotion, transformer_score, transformer_label = detect_emotion_transformer(message)
+    rule_emotion = detect_emotion_rule(message, topic, sarcastic, rude, escalation)
+
+    # Use transformer only when it is confident and not contradicted by strong rules.
+    if transformer_emotion and transformer_score >= 0.70 and not (rude or escalation or sarcastic):
+        emotion = transformer_emotion
+        source = f"Transformer ({transformer_label})"
+    else:
+        emotion = rule_emotion
+        source = "Rule Engine"
+
+    tone = detect_tone(emotion, sarcastic, rude, escalation)
+    risk_score, risk_reason = calculate_risk(emotion, topic, message, sarcastic, rude, escalation)
+    risk_level = get_risk_level(risk_score)
+
+    customer_reply = generate_customer_reply(message, topic, active_topic, rude, escalation, reference, eta)
+
     conversation = format_conversation(st.session_state.chat_messages)
-    records = load_records()
-    case_found = False
+    ai_private = gemini_private_analysis(message, conversation)
 
+    if escalation:
+        customer_intent = "Customer wants manager or human support."
+        business_risk = "Escalation request indicates high dissatisfaction and potential churn risk."
+        recommended_action = "Manager should review this case and follow up as soon as possible."
+    elif topic == "Delivery Issue":
+        customer_intent = "Customer wants delivery status, tracking, or resolution."
+        business_risk = "Customer satisfaction may decrease if delivery status is not clarified."
+        recommended_action = "Route to delivery team and provide clear shipment update."
+    elif topic == "Refund Issue":
+        customer_intent = "Customer wants refund or money-related resolution."
+        business_risk = "Refund concern may lead to escalation or cancellation if delayed."
+        recommended_action = "Review refund eligibility and update customer clearly."
+    elif topic == "Billing Issue":
+        customer_intent = "Customer wants billing/payment issue reviewed."
+        business_risk = "Billing issues can reduce trust and create urgent dissatisfaction."
+        recommended_action = "Route to billing team and verify payment/invoice details."
+    elif topic == "Product Issue":
+        customer_intent = "Customer wants product issue reviewed or resolved."
+        business_risk = "Product issues may cause refund, replacement, or negative feedback."
+        recommended_action = "Route to product/support team and review replacement options."
+    elif topic == "Technical Issue":
+        customer_intent = "Customer wants technical support."
+        business_risk = "Technical failure may prevent usage and reduce satisfaction."
+        recommended_action = "Route to technical team and request troubleshooting details if needed."
+    else:
+        customer_intent = "Customer wants the issue reviewed and resolved."
+        business_risk = "Customer satisfaction may decrease if the issue is not handled promptly."
+        recommended_action = "Review the case, assign the correct team, and follow up if risk is medium or high."
+
+    customer_intent = clean_display(ai_private.get("customer_intent", customer_intent), customer_intent)
+    business_risk = clean_display(ai_private.get("business_risk", business_risk), business_risk)
+    recommended_action = clean_display(ai_private.get("recommended_action", recommended_action), recommended_action)
+
+    return {
+        "clean_text": cleaned,
+        "analysis_source": source,
+        "emotion": emotion,
+        "tone": tone,
+        "sarcasm": "Yes" if sarcastic else "No",
+        "sarcasm_reason": sarcasm_reason,
+        "escalation_requested": "Yes" if escalation else "No",
+        "complaint_topic": topic,
+        "customer_intent": customer_intent,
+        "business_risk": business_risk,
+        "risk_score": risk_score,
+        "risk_level": risk_level,
+        "risk_reason": risk_reason,
+        "recommended_action": recommended_action,
+        "customer_reply": customer_reply,
+        "actionable": is_actionable_message(message, topic, st.session_state.active_case_id, rude, escalation, reference, eta),
+        "manager_status": "Escalated" if escalation else "New",
+        "manager_owner": "Manager" if escalation else "Unassigned",
+    }
+
+
+def append_journey(existing: str, value: Any) -> str:
+    value = clean_display(value, "")
+    if value == "":
+        return existing
+    parts = [p.strip() for p in str(existing).split("→") if p.strip()]
+    parts.append(value)
+    return " → ".join(parts[-12:])
+
+
+def create_or_update_active_case(customer_id: str, message: str, analysis: Dict[str, Any], coupon: Dict[str, str]) -> str:
+    case_id = get_active_case_id()
+    records = load_records()
+    current_time = now_str()
+    conversation = format_conversation(st.session_state.chat_messages)
+
+    found = False
     for record in records:
         if str(record.get("case_id", "")) == str(case_id):
-            record.update({
-                "customer_id": customer_id,
-                "message": user_message,
-                "conversation": conversation,
-                "clean_text": analysis["clean_text"],
-                "analysis_source": analysis["analysis_source"],
-                "emotion": analysis["emotion"],
-                "sarcasm_detected": analysis["sarcasm_detected"],
-                "sarcasm_reason": analysis["sarcasm_reason"],
-                "complaint_topic": analysis["complaint_topic"],
-                "customer_intent": analysis["customer_intent"],
-                "business_risk": analysis["business_risk"],
-                "risk_score": analysis["risk_score"],
-                "risk_level": analysis["risk_level"],
-                "risk_reason": analysis["risk_reason"],
-                "recommended_action": analysis["recommended_action"],
-                "customer_reply": analysis["customer_reply"],
-                "last_updated": now,
-            })
-            if str(record.get("coupon_status", "")) in ["", "Not Required", "Optional", "Suggested"]:
+            record["customer_id"] = customer_id
+            record["last_updated"] = current_time
+            record["message"] = message
+            record["conversation"] = conversation
+            record["clean_text"] = analysis["clean_text"]
+            record["analysis_source"] = analysis["analysis_source"]
+            record["emotion"] = analysis["emotion"]
+            record["tone"] = analysis["tone"]
+            record["sarcasm"] = analysis["sarcasm"]
+            record["escalation_requested"] = analysis["escalation_requested"]
+            record["complaint_topic"] = analysis["complaint_topic"]
+            record["customer_intent"] = analysis["customer_intent"]
+            record["business_risk"] = analysis["business_risk"]
+            record["risk_score"] = max(int(record.get("risk_score", 0) or 0), int(analysis["risk_score"]))
+            record["risk_level"] = get_risk_level(int(record["risk_score"]))
+            record["risk_reason"] = analysis["risk_reason"]
+            record["recommended_action"] = analysis["recommended_action"]
+            record["customer_reply"] = analysis["customer_reply"]
+            if analysis["manager_status"] == "Escalated":
+                record["status"] = "Escalated"
+                record["assigned_to"] = "Manager"
+            record["emotion_journey"] = append_journey(record.get("emotion_journey", ""), analysis["emotion"])
+            record["topic_journey"] = append_journey(record.get("topic_journey", ""), analysis["complaint_topic"])
+            record["risk_journey"] = append_journey(record.get("risk_journey", ""), analysis["risk_score"])
+
+            current_coupon_status = str(record.get("coupon_status", ""))
+            if current_coupon_status in ["", "Not Required", "Optional", "Suggested"]:
                 record.update(coupon)
-            case_found = True
+            found = True
             break
 
-    if not case_found:
-        new_record = {
+    if not found:
+        records.append({
             "case_id": case_id,
             "customer_id": customer_id,
-            "timestamp": now,
-            "message": user_message,
+            "timestamp": current_time,
+            "last_updated": current_time,
+            "message": message,
             "conversation": conversation,
             "clean_text": analysis["clean_text"],
             "analysis_source": analysis["analysis_source"],
             "emotion": analysis["emotion"],
-            "sarcasm_detected": analysis["sarcasm_detected"],
-            "sarcasm_reason": analysis["sarcasm_reason"],
+            "tone": analysis["tone"],
+            "sarcasm": analysis["sarcasm"],
+            "escalation_requested": analysis["escalation_requested"],
             "complaint_topic": analysis["complaint_topic"],
             "customer_intent": analysis["customer_intent"],
             "business_risk": analysis["business_risk"],
@@ -1258,33 +1102,53 @@ def create_or_update_active_case(customer_id: str, user_message: str, analysis: 
             "risk_reason": analysis["risk_reason"],
             "recommended_action": analysis["recommended_action"],
             "customer_reply": analysis["customer_reply"],
-            "status": "New",
-            "assigned_to": "Unassigned",
-            "internal_notes": "",
+            "status": analysis["manager_status"],
+            "assigned_to": analysis["manager_owner"],
             "resolution_action": "",
-            **coupon,
-            "last_updated": now,
-        }
-        records.append(new_record)
+            "coupon_offer": coupon["coupon_offer"],
+            "coupon_code": coupon["coupon_code"],
+            "coupon_status": coupon["coupon_status"],
+            "coupon_reason": coupon["coupon_reason"],
+            "emotion_journey": analysis["emotion"],
+            "topic_journey": analysis["complaint_topic"],
+            "risk_journey": str(analysis["risk_score"]),
+        })
 
     save_records(records)
     st.session_state.records = records
     return case_id
 
 
+def update_case_record(case_id: str, updates: Dict[str, Any]) -> None:
+    records = load_records()
+    for record in records:
+        if str(record.get("case_id", "")) == str(case_id):
+            for k, v in updates.items():
+                record[k] = v
+            record["last_updated"] = now_str()
+            break
+    save_records(records)
+    st.session_state.records = records
+
+
 # ============================================================
-# Manager Data Helpers
+# Manager data
 # ============================================================
 
 def enrich_manager_data(data: pd.DataFrame) -> pd.DataFrame:
     if len(data) == 0:
         return data
-    data = data.copy()
+
+    data = data.copy().fillna("")
+    data["risk_score"] = pd.to_numeric(data["risk_score"], errors="coerce").fillna(0).astype(int)
     data["timestamp_dt"] = pd.to_datetime(data["timestamp"], errors="coerce")
+    data["last_updated_dt"] = pd.to_datetime(data["last_updated"], errors="coerce")
+
     now = pd.Timestamp.now()
     data["case_age_hours"] = ((now - data["timestamp_dt"]).dt.total_seconds() / 3600).fillna(0).clip(lower=0).round(1)
-    data["priority_score"] = pd.to_numeric(data["risk_score"], errors="coerce").fillna(0).astype(int)
+    data["priority_score"] = data["risk_score"].copy()
     data.loc[data["status"] == "Escalated", "priority_score"] += 10
+    data.loc[data["escalation_requested"] == "Yes", "priority_score"] += 10
     data["priority_score"] = data["priority_score"].clip(upper=100)
 
     def priority(row):
@@ -1309,425 +1173,39 @@ def enrich_manager_data(data: pd.DataFrame) -> pd.DataFrame:
 
     data["priority"] = data.apply(priority, axis=1)
     data["sla_status"] = data.apply(sla, axis=1)
+
+    for col in data.columns:
+        if data[col].dtype == object:
+            data[col] = data[col].apply(lambda x: "" if is_blank(x) else str(x))
     return data
 
 
-def generate_manager_brief(record: Dict) -> str:
-    return (
-        f"Priority: {record.get('priority', record.get('risk_level', 'Unknown'))}\n\n"
-        f"Main issue: {record.get('complaint_topic', 'General issue')} from customer {record.get('customer_id', '')}.\n\n"
-        f"Why it matters: {record.get('business_risk', 'This may affect satisfaction.')}\n\n"
-        f"Recommended action: {record.get('recommended_action', 'Review and follow up.')}\n\n"
-        f"Recovery offer: {record.get('coupon_offer', 'No coupon needed')} | Status: {record.get('coupon_status', 'Not Required')}"
-    )
-
-
-def generate_journey_insight(customer_id: str, customer_data: pd.DataFrame) -> str:
-    if len(customer_data) == 0:
-        return "No customer journey available."
-    first_score = int(customer_data.iloc[0]["risk_score"])
-    latest_score = int(customer_data.iloc[-1]["risk_score"])
-    trend = "increasing" if latest_score > first_score else "decreasing" if latest_score < first_score else "stable"
-    latest = customer_data.iloc[-1]
-    return (
-        f"Customer {customer_id} has a {trend} risk pattern. Latest topic is {latest['complaint_topic']}, "
-        f"latest emotion is {latest['emotion']}, and latest risk level is {latest['risk_level']}. "
-        "Manager should review the latest transcript and follow up if the case is medium or high risk."
-    )
-
-
-# ============================================================
-# Password
-# ============================================================
-
-def check_manager_access() -> bool:
-    if st.session_state.get("manager_authenticated", False):
-        return True
-
-    st.markdown('<div class="glass-card"><div class="section-title">Manager Access</div><div class="muted">Protected internal workspace.</div></div>', unsafe_allow_html=True)
-    password = st.text_input("Enter manager password", type="password")
-    if st.button("Login"):
-        correct = get_secret_value("MANAGER_PASSWORD", "")
-        if correct == "":
-            st.error("MANAGER_PASSWORD is missing in Streamlit Secrets.")
-            return False
-        if hmac.compare_digest(password, correct):
-            st.session_state.manager_authenticated = True
-            st.rerun()
-        else:
-            st.error("Incorrect password.")
-    return False
-
-
-# ============================================================
-# Updated UI, Customer-Level Workflow, and Journey Pages
-# ============================================================
-
-# Add one extra column for within-customer emotion history. Redefining this
-# global works because storage functions read EXPECTED_COLUMNS at runtime.
-EXPECTED_COLUMNS = [
-    "case_id",
-    "customer_id",
-    "timestamp",
-    "message",
-    "conversation",
-    "emotion_journey",
-    "clean_text",
-    "analysis_source",
-    "emotion",
-    "sarcasm_detected",
-    "sarcasm_reason",
-    "complaint_topic",
-    "customer_intent",
-    "business_risk",
-    "risk_score",
-    "risk_level",
-    "risk_reason",
-    "recommended_action",
-    "customer_reply",
-    "status",
-    "assigned_to",
-    "internal_notes",
-    "resolution_action",
-    "coupon_offer",
-    "coupon_code",
-    "coupon_status",
-    "coupon_reason",
-    "last_updated",
-]
-
-st.markdown(
-    """
-    <style>
-        .stApp {
-            background:
-                radial-gradient(circle at 20% 0%, rgba(37,99,235,.13), transparent 28%),
-                radial-gradient(circle at 90% 20%, rgba(20,184,166,.11), transparent 27%),
-                linear-gradient(180deg, #f7fbff 0%, #eef4fb 55%, #f8fafc 100%) !important;
-        }
-
-        .hero {
-            background:
-                linear-gradient(135deg, #07111f 0%, #102238 55%, #153b58 100%) !important;
-            border-radius: 34px !important;
-            position: relative;
-            overflow: hidden;
-        }
-
-        .hero:after {
-            content: "";
-            position: absolute;
-            right: -70px;
-            top: -80px;
-            width: 260px;
-            height: 260px;
-            background: radial-gradient(circle, rgba(56,189,248,.35), transparent 65%);
-            border-radius: 999px;
-        }
-
-        .ops-grid-card {
-            background: rgba(255,255,255,.82);
-            border: 1px solid rgba(203,213,225,.9);
-            border-radius: 28px;
-            padding: 24px;
-            box-shadow: 0 22px 50px rgba(15,23,42,.08);
-            backdrop-filter: blur(18px);
-            min-height: 190px;
-        }
-
-        .ops-card-title {
-            font-size: 21px;
-            font-weight: 950;
-            color: #07111f;
-            letter-spacing: -.03em;
-            margin-bottom: 8px;
-        }
-
-        .flow-step {
-            display: flex;
-            gap: 12px;
-            align-items: flex-start;
-            margin: 12px 0;
-        }
-
-        .flow-num {
-            min-width: 28px;
-            height: 28px;
-            border-radius: 10px;
-            background: #0f172a;
-            color: white;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-weight: 900;
-            font-size: 13px;
-        }
-
-        .flow-text {
-            color: #475569;
-            line-height: 1.55;
-            font-size: 14px;
-        }
-
-        .queue-card {
-            background: white;
-            border: 1px solid #dbeafe;
-            border-left: 6px solid #2563eb;
-            border-radius: 24px;
-            padding: 18px 20px;
-            box-shadow: 0 14px 36px rgba(37,99,235,.08);
-        }
-
-        .intel-card {
-            background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
-            border: 1px solid #dbeafe;
-            border-radius: 26px;
-            padding: 22px;
-            box-shadow: 0 18px 40px rgba(15,23,42,.07);
-            margin-bottom: 16px;
-        }
-
-        .mini-label {
-            color: #64748b;
-            font-size: 12px;
-            text-transform: uppercase;
-            letter-spacing: .08em;
-            font-weight: 900;
-            margin-bottom: 4px;
-        }
-
-        .mini-value {
-            color: #0f172a;
-            font-size: 17px;
-            font-weight: 850;
-            margin-bottom: 14px;
-        }
-
-        .emotion-strip {
-            display: flex;
-            align-items: stretch;
-            gap: 10px;
-            overflow-x: auto;
-            padding: 14px 4px 20px 4px;
-        }
-
-        .emotion-node {
-            min-width: 165px;
-            background: white;
-            border: 1px solid #e2e8f0;
-            border-radius: 22px;
-            padding: 14px;
-            box-shadow: 0 14px 30px rgba(15,23,42,.07);
-        }
-
-        .emotion-name {
-            font-size: 18px;
-            font-weight: 950;
-            color: #0f172a;
-            letter-spacing: -.02em;
-        }
-
-        .emotion-meta {
-            color: #64748b;
-            font-size: 12px;
-            line-height: 1.5;
-            margin-top: 6px;
-        }
-
-        .arrow-node {
-            display: flex;
-            align-items: center;
-            color: #94a3b8;
-            font-size: 24px;
-            font-weight: 900;
-        }
-
-        .chat-wrap {
-            background: rgba(255,255,255,.74);
-            border: 1px solid rgba(226,232,240,.95);
-            border-radius: 30px;
-            padding: 22px;
-            box-shadow: 0 22px 55px rgba(15,23,42,.08);
-        }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-# ============================================================
-# Updated Helpers
-# ============================================================
-
-def reset_chat_for_new_customer() -> None:
-    st.session_state.chat_messages = [
-        {"role": "assistant", "content": "Hi, I’m your support assistant. What type of issue are you facing today?"}
-    ]
-    st.session_state.active_case_id = ""
-    st.session_state.selected_issue_type = "Not sure yet"
-
-
-def make_emotion_event(emotion: str, risk_score: int, topic: str, message: str) -> str:
-    stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-    short_message = str(message).replace("|", "/").replace("\n", " ")[:70]
-    return f"{stamp}|{emotion}|{risk_score}|{topic}|{short_message}"
-
-
-def append_emotion_event(existing: str, emotion: str, risk_score: int, topic: str, message: str) -> str:
-    events = [line for line in str(existing or "").split("\n") if line.strip()]
-    events.append(make_emotion_event(emotion, risk_score, topic, message))
-    return "\n".join(events[-25:])
-
-
-def parse_emotion_journey(text: str) -> List[Dict]:
-    events = []
-    for line in str(text or "").split("\n"):
-        parts = line.split("|", 4)
-        if len(parts) == 5:
-            stamp, emotion, risk, topic, message = parts
-            events.append({"time": stamp, "emotion": emotion, "risk": risk, "topic": topic, "message": message})
-    return events
-
-
-def render_emotion_journey(events: List[Dict]) -> None:
-    if not events:
-        st.info("No emotion journey has been recorded yet.")
-        return
-
-    html_parts = ['<div class="emotion-strip">']
-    for i, event in enumerate(events):
-        html_parts.append(
-            f"""
-            <div class="emotion-node">
-                <div class="emotion-name">{safe_text(event.get('emotion',''))}</div>
-                <div class="emotion-meta">
-                    Risk: {safe_text(event.get('risk',''))}%<br>
-                    Topic: {safe_text(event.get('topic',''))}<br>
-                    {safe_text(event.get('time',''))}
-                </div>
-            </div>
-            """
-        )
-        if i < len(events) - 1:
-            html_parts.append('<div class="arrow-node">→</div>')
-    html_parts.append('</div>')
-    st.markdown("".join(html_parts), unsafe_allow_html=True)
-
-
-def create_or_update_active_case(customer_id: str, user_message: str, analysis: Dict, coupon: Dict) -> str:
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    case_id = get_active_case_id()
-    conversation = format_conversation(st.session_state.chat_messages)
-    records = load_records()
-    case_found = False
-
-    for record in records:
-        if str(record.get("case_id", "")) == str(case_id):
-            emotion_journey = append_emotion_event(
-                record.get("emotion_journey", ""),
-                analysis["emotion"],
-                analysis["risk_score"],
-                analysis["complaint_topic"],
-                user_message,
-            )
-            record.update({
-                "customer_id": customer_id,
-                "message": user_message,
-                "conversation": conversation,
-                "emotion_journey": emotion_journey,
-                "clean_text": analysis["clean_text"],
-                "analysis_source": analysis["analysis_source"],
-                "emotion": analysis["emotion"],
-                "sarcasm_detected": analysis["sarcasm_detected"],
-                "sarcasm_reason": analysis["sarcasm_reason"],
-                "complaint_topic": analysis["complaint_topic"],
-                "customer_intent": analysis["customer_intent"],
-                "business_risk": analysis["business_risk"],
-                "risk_score": analysis["risk_score"],
-                "risk_level": analysis["risk_level"],
-                "risk_reason": analysis["risk_reason"],
-                "recommended_action": analysis["recommended_action"],
-                "customer_reply": analysis["customer_reply"],
-                "last_updated": now,
-            })
-            if str(record.get("coupon_status", "")) in ["", "Not Required", "Optional", "Suggested"]:
-                record.update(coupon)
-            case_found = True
-            break
-
-    if not case_found:
-        new_record = {
-            "case_id": case_id,
-            "customer_id": customer_id,
-            "timestamp": now,
-            "message": user_message,
-            "conversation": conversation,
-            "emotion_journey": append_emotion_event("", analysis["emotion"], analysis["risk_score"], analysis["complaint_topic"], user_message),
-            "clean_text": analysis["clean_text"],
-            "analysis_source": analysis["analysis_source"],
-            "emotion": analysis["emotion"],
-            "sarcasm_detected": analysis["sarcasm_detected"],
-            "sarcasm_reason": analysis["sarcasm_reason"],
-            "complaint_topic": analysis["complaint_topic"],
-            "customer_intent": analysis["customer_intent"],
-            "business_risk": analysis["business_risk"],
-            "risk_score": analysis["risk_score"],
-            "risk_level": analysis["risk_level"],
-            "risk_reason": analysis["risk_reason"],
-            "recommended_action": analysis["recommended_action"],
-            "customer_reply": analysis["customer_reply"],
-            "status": "New",
-            "assigned_to": "Unassigned",
-            "internal_notes": "",
-            "resolution_action": "",
-            **coupon,
-            "last_updated": now,
-        }
-        records.append(new_record)
-
-    save_records(records)
-    st.session_state.records = records
-    return case_id
-
-
-def customer_queue_summary(data: pd.DataFrame) -> pd.DataFrame:
+def customer_level_view(data: pd.DataFrame) -> pd.DataFrame:
     if len(data) == 0:
         return data
-
     data = data.copy()
-    if "timestamp_dt" not in data.columns:
-        data["timestamp_dt"] = pd.to_datetime(data["timestamp"], errors="coerce")
-    data["updated_dt"] = pd.to_datetime(data["last_updated"], errors="coerce")
-    data["updated_dt"] = data["updated_dt"].fillna(data["timestamp_dt"])
-
-    sorted_data = data.sort_values(
-        by=["customer_id", "priority_score", "updated_dt"],
-        ascending=[True, False, False],
-    )
-    summary = sorted_data.groupby("customer_id", as_index=False).head(1).copy()
-
-    case_counts = data.groupby("customer_id")["case_id"].nunique()
-    open_counts = data[data["status"] != "Resolved"].groupby("customer_id")["case_id"].nunique()
-    max_risk = data.groupby("customer_id")["risk_score"].max()
-
-    summary["case_count"] = summary["customer_id"].map(case_counts).fillna(0).astype(int)
-    summary["open_case_count"] = summary["customer_id"].map(open_counts).fillna(0).astype(int)
-    summary["max_customer_risk"] = summary["customer_id"].map(max_risk).fillna(summary["risk_score"]).astype(int)
-
-    return summary.sort_values(by=["priority_score", "updated_dt"], ascending=[False, False])
-
-
-def get_customer_representative_record(data: pd.DataFrame, customer_id: str) -> Dict:
-    customer_rows = data[data["customer_id"] == customer_id].copy()
-    if len(customer_rows) == 0:
-        return {}
-    customer_rows = customer_rows.sort_values(by=["priority_score", "case_age_hours"], ascending=[False, False])
-    return customer_rows.iloc[0].to_dict()
+    data["sort_updated"] = pd.to_datetime(data["last_updated"], errors="coerce")
+    data = data.sort_values(["risk_score", "sort_updated"], ascending=[False, False])
+    view = data.groupby("customer_id", as_index=False).first()
+    view = view.sort_values(["priority_score", "sort_updated"], ascending=[False, False])
+    return view
 
 
 # ============================================================
-# Session State
+# Session state
 # ============================================================
+
+def intro_message() -> str:
+    return "Hi, I’m your support assistant. What type of issue are you facing today?"
+
+
+def reset_chat(new_customer: bool = False) -> None:
+    st.session_state.chat_messages = [{"role": "assistant", "content": intro_message()}]
+    st.session_state.active_case_id = ""
+    st.session_state.last_case_id = ""
+    if new_customer:
+        st.session_state.selected_issue_type = "Not sure yet"
+
 
 if "records" not in st.session_state:
     st.session_state.records = load_records()
@@ -1735,438 +1213,461 @@ if "manager_authenticated" not in st.session_state:
     st.session_state.manager_authenticated = False
 if "chat_customer_id" not in st.session_state:
     st.session_state.chat_customer_id = "C001"
-if "selected_issue_type" not in st.session_state:
-    st.session_state.selected_issue_type = "Not sure yet"
-if "ui_theme" not in st.session_state:
-    st.session_state.ui_theme = "Light"
-if "message_prefill" not in st.session_state:
-    st.session_state.message_prefill = ""
+if "customer_input_value" not in st.session_state:
+    st.session_state.customer_input_value = st.session_state.chat_customer_id
 if "active_case_id" not in st.session_state:
     st.session_state.active_case_id = ""
+if "last_case_id" not in st.session_state:
+    st.session_state.last_case_id = ""
+if "selected_issue_type" not in st.session_state:
+    st.session_state.selected_issue_type = "Not sure yet"
 if "chat_messages" not in st.session_state:
-    st.session_state.chat_messages = [
-        {"role": "assistant", "content": "Hi, I’m your support assistant. What type of issue are you facing today?"}
-    ]
+    reset_chat()
 
 
 # ============================================================
-# Sidebar
+# Sidebar and theme selector
 # ============================================================
 
-st.sidebar.title("VoiceOps")
-page = st.sidebar.radio("Workspace", ["AI Support Chat", "Manager Command Center", "Journey Monitor", "About System"])
+apply_css(st.session_state.ui_theme)
+
+st.sidebar.title(APP_NAME)
+st.sidebar.caption("Customer Recovery Workspace")
+page = st.sidebar.radio(
+    "Workspace",
+    ["AI Support Chat", "Manager Command Center", "Journey Monitor", "About System"],
+)
 st.sidebar.markdown("---")
 if st.session_state.get("manager_authenticated", False):
     if st.sidebar.button("Logout Manager"):
         st.session_state.manager_authenticated = False
         st.rerun()
 
-# Top-right theme selector. Streamlit columns collapse naturally on phones/tablets.
-_theme_left, _theme_right = st.columns([0.82, 0.18])
-with _theme_right:
-    st.session_state.ui_theme = st.selectbox(
-        "Theme",
-        ["Light", "Dark"],
-        index=["Light", "Dark"].index(st.session_state.ui_theme),
-        label_visibility="collapsed",
-    )
-inject_device_and_theme_css(st.session_state.ui_theme)
+# Theme corner
+_, theme_col = st.columns([0.78, 0.22])
+with theme_col:
+    st.selectbox("Theme", ["Light", "Dark"], key="ui_theme", label_visibility="collapsed")
 
 
 # ============================================================
-# Page 1: AI Support Chat
+# Manager auth
+# ============================================================
+
+def get_manager_password() -> str:
+    return get_secret_value("MANAGER_PASSWORD", "")
+
+
+def check_manager_access() -> bool:
+    if st.session_state.get("manager_authenticated", False):
+        return True
+
+    st.markdown(
+        """
+        <div class="glass-card">
+            <div class="section-title">Manager Access</div>
+            <div class="muted">This workspace is protected for internal support teams.</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    password = st.text_input("Enter manager password", type="password")
+    if st.button("Login"):
+        correct_password = get_manager_password()
+        if correct_password == "":
+            st.error("MANAGER_PASSWORD is not configured in Streamlit Secrets.")
+            return False
+        if hmac.compare_digest(password, correct_password):
+            st.session_state.manager_authenticated = True
+            st.success("Login successful.")
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+    return False
+
+
+# ============================================================
+# Page: AI Support Chat
 # ============================================================
 
 if page == "AI Support Chat":
     hero(
-        "AI Support Chat",
-        "A responsive guided assistant. Greetings stay friendly, real issues become one active customer case, and managers see the intelligence privately.",
+        "AI Customer Support Recovery System",
+        "Customers chat with a support assistant. Important issues become manager-reviewed recovery cases.",
     )
 
-    # Customer Context first, Smart Support Flow second. On mobile these stack cleanly.
-    context_col, flow_col = st.columns([1.0, 1.0], gap="large")
+    top_left, top_right = st.columns([0.62, 0.38], gap="large")
 
-    with context_col:
+    with top_left:
         st.markdown(
             """
-            <div class="ops-grid-card">
-                <div class="ops-card-title">Customer Context</div>
-                <div class="muted">Changing the customer ID automatically starts a fresh conversation and a new active case.</div>
+            <div class="glass-card">
+                <div class="section-title">Customer Context</div>
+                <div class="muted">Changing the customer/order ID automatically starts a fresh conversation.</div>
             </div>
             """,
             unsafe_allow_html=True,
         )
         new_customer_id = st.text_input(
             "Customer ID or Order ID",
-            value=st.session_state.chat_customer_id,
+            value=st.session_state.customer_input_value,
             placeholder="Example: C001 or ORD123",
         )
-        if new_customer_id.strip() != st.session_state.chat_customer_id:
-            st.session_state.chat_customer_id = new_customer_id.strip() or "C001"
-            reset_chat_for_new_customer()
+        if new_customer_id != st.session_state.chat_customer_id:
+            st.session_state.chat_customer_id = new_customer_id
+            st.session_state.customer_input_value = new_customer_id
+            reset_chat(new_customer=True)
             st.rerun()
 
         st.session_state.selected_issue_type = st.selectbox(
             "Issue Type",
-            ISSUE_TYPES,
-            index=ISSUE_TYPES.index(st.session_state.selected_issue_type),
-            help="This is only a routing hint. The message content still decides the final topic and risk.",
+            [
+                "Not sure yet",
+                "Delivery Issue",
+                "Refund Issue",
+                "Billing Issue",
+                "Product Issue",
+                "Technical Issue",
+                "Customer Service Issue",
+                "General Complaint",
+            ],
+            index=[
+                "Not sure yet",
+                "Delivery Issue",
+                "Refund Issue",
+                "Billing Issue",
+                "Product Issue",
+                "Technical Issue",
+                "Customer Service Issue",
+                "General Complaint",
+            ].index(st.session_state.selected_issue_type),
         )
         if st.session_state.active_case_id:
-            st.info(f"Active customer case: {st.session_state.active_case_id}")
+            st.info(f"Active case: {st.session_state.active_case_id}")
         if st.button("Start New Chat"):
-            reset_chat_for_new_customer()
+            reset_chat(new_customer=False)
             st.rerun()
 
-    with flow_col:
-        st.markdown(
-            """
-            <div class="ops-grid-card">
-                <div class="ops-card-title">Smart Support Flow</div>
-                <div class="flow-step"><div class="flow-num">1</div><div class="flow-text">Greet normally when the customer says hi/hello.</div></div>
-                <div class="flow-step"><div class="flow-num">2</div><div class="flow-text">Ask for useful details only when the issue is unclear.</div></div>
-                <div class="flow-step"><div class="flow-num">3</div><div class="flow-text">One customer conversation updates one case, not one case per message.</div></div>
-                <div class="flow-step"><div class="flow-num">4</div><div class="flow-text">Coupons and risk signals stay hidden from customers.</div></div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+    with top_right:
         st.markdown(
             """
             <div class="glass-card">
-                <div class="ops-card-title">Quick Suggestions</div>
-                <div class="muted">Use these only for testing the assistant across devices.</div>
+                <div class="section-title">Smart Support Flow</div>
+                <p class="muted">1. Greet the assistant.</p>
+                <p class="muted">2. Describe the issue naturally.</p>
+                <p class="muted">3. Ask for manager support if needed.</p>
+                <p class="muted">4. Managers privately see emotion, tone, risk, SLA, and recovery suggestions.</p>
             </div>
             """,
             unsafe_allow_html=True,
         )
-        q1, q2, q3 = st.columns(3)
-        with q1:
-            if st.button("Missing package"):
-                st.session_state.message_prefill = "My package is missing."
-                st.rerun()
-        with q2:
-            if st.button("Refund issue"):
-                st.session_state.message_prefill = "I want a refund because I received the wrong item."
-                st.rerun()
-        with q3:
-            if st.button("Sarcasm test"):
-                st.session_state.message_prefill = "Great service, my package is only 10 days late."
-                st.rerun()
 
     st.markdown(
         """
-        <div class="chat-wrap">
+        <div class="glass-card">
             <div class="section-title">Support Conversation</div>
-            <div class="muted">Continue naturally. The assistant gives message-specific replies and updates the same active case when the message is actionable.</div>
+            <div class="muted">Greetings will not create cases. Actionable messages update the same support case until a new chat or new customer ID is started.</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    for chat in st.session_state.chat_messages:
-        with st.chat_message(chat["role"]):
-            st.write(chat["content"])
+    for message in st.session_state.chat_messages:
+        render_message(message["role"], message["content"])
 
-    with st.form("support_message_form", clear_on_submit=True):
-        user_message = st.text_input(
-            "Message",
-            value=st.session_state.message_prefill,
-            placeholder="Type your message here...",
-        )
-        send_clicked = st.form_submit_button("Send Message")
+    with st.form("chat_form", clear_on_submit=True):
+        user_message = st.text_input("Message", placeholder="Type your message here...")
+        sent = st.form_submit_button("Send Message")
 
-    if send_clicked:
-        st.session_state.message_prefill = ""
-        if user_message.strip() == "":
-            st.warning("Please type a message before sending.")
+    if sent and user_message.strip():
+        st.session_state.chat_messages.append({"role": "user", "content": user_message})
+
+        active_topic = get_active_topic()
+        analysis = analyze_message(user_message, st.session_state.selected_issue_type, active_topic)
+
+        if analysis["actionable"]:
+            case_id = get_active_case_id()
+            coupon = suggest_recovery_coupon(
+                analysis["risk_level"],
+                analysis["risk_score"],
+                analysis["complaint_topic"],
+                case_id,
+            )
+            st.session_state.chat_messages.append({"role": "assistant", "content": analysis["customer_reply"]})
+            saved_case_id = create_or_update_active_case(
+                st.session_state.chat_customer_id,
+                user_message,
+                analysis,
+                coupon,
+            )
+            st.session_state.last_case_id = saved_case_id
         else:
-            st.session_state.chat_messages.append({"role": "user", "content": user_message})
-            with st.spinner("Reviewing message..."):
-                analysis = analyze_feedback(user_message, st.session_state.selected_issue_type, st.session_state.chat_messages)
-                assistant_reply = analysis["customer_reply"]
-                st.session_state.chat_messages.append({"role": "assistant", "content": assistant_reply})
+            st.session_state.chat_messages.append({"role": "assistant", "content": analysis["customer_reply"]})
 
-                if analysis.get("actionable_case", True):
-                    case_id = get_active_case_id()
-                    coupon = suggest_recovery_coupon(
-                        analysis["risk_level"],
-                        analysis["risk_score"],
-                        analysis["complaint_topic"],
-                        case_id,
-                    )
-                    create_or_update_active_case(st.session_state.chat_customer_id, user_message, analysis, coupon)
-            st.rerun()
+        st.rerun()
 
 
 # ============================================================
-# Page 2: Manager Command Center
+# Page: Manager Command Center
 # ============================================================
 
 elif page == "Manager Command Center":
     if not check_manager_access():
         st.stop()
 
-    hero("Manager Command Center", "A customer-level operations console for risk, SLA, team ownership, and recovery decisions.")
+    hero(
+        "Manager Command Center",
+        "Customer-level risk monitoring, escalation detection, and manager-only recovery offers.",
+    )
+
     data = enrich_manager_data(prepare_dataframe(load_records()))
+    customer_view = customer_level_view(data)
 
     if len(data) == 0:
         st.info("No support cases yet.")
     else:
-        customer_summary = customer_queue_summary(data)
-        open_customers = len(customer_summary[customer_summary["open_case_count"] > 0])
-        high_priority = len(customer_summary[customer_summary["priority"].isin(["Critical", "High"])])
-        overdue_customers = len(customer_summary[customer_summary["sla_status"] == "Overdue"])
-        coupon_customers = len(customer_summary[customer_summary["coupon_status"].isin(["Suggested", "Optional", "Approved"])])
-        avg_risk = round(customer_summary["risk_score"].mean(), 1)
+        open_cases = len(data[data["status"] != "Resolved"])
+        high_customers = len(customer_view[customer_view["risk_level"] == "High"])
+        escalations = len(data[data["status"] == "Escalated"])
+        offers = len(data[data["coupon_status"].isin(["Suggested", "Optional", "Approved"])])
+        avg_risk = round(float(customer_view["risk_score"].mean()), 1) if len(customer_view) else 0
 
         k1, k2, k3, k4, k5 = st.columns(5)
-        with k1: kpi_card("Customers", len(customer_summary))
-        with k2: kpi_card("Open Customers", open_customers)
-        with k3: kpi_card("High Priority", high_priority)
-        with k4: kpi_card("Overdue", overdue_customers)
-        with k5: kpi_card("Avg Risk", avg_risk)
+        with k1:
+            kpi_card("Open Cases", open_cases)
+        with k2:
+            kpi_card("High-Risk Customers", high_customers)
+        with k3:
+            kpi_card("Escalations", escalations)
+        with k4:
+            kpi_card("Recovery Offers", offers)
+        with k5:
+            kpi_card("Avg Customer Risk", avg_risk)
 
         st.markdown("---")
         tab1, tab2, tab3, tab4 = st.tabs(["Priority Queue", "Case Review", "Coupon Center", "Analytics"])
 
         with tab1:
             st.subheader("Customer Priority Queue")
-            f1, f2, f3, f4 = st.columns(4)
-            with f1:
-                selected_status = st.multiselect("Status", sorted(customer_summary["status"].dropna().unique().tolist()), default=sorted(customer_summary["status"].dropna().unique().tolist()))
-            with f2:
-                selected_priority = st.multiselect("Priority", ["Critical", "High", "Medium", "Low"], default=["Critical", "High", "Medium", "Low"])
-            with f3:
-                selected_sla = st.multiselect("SLA", ["Overdue", "On Track", "Closed"], default=["Overdue", "On Track", "Closed"])
-            with f4:
-                selected_owner = st.multiselect("Owner", sorted(customer_summary["assigned_to"].dropna().unique().tolist()), default=sorted(customer_summary["assigned_to"].dropna().unique().tolist()))
-
-            filtered = customer_summary[
-                customer_summary["status"].isin(selected_status)
-                & customer_summary["priority"].isin(selected_priority)
-                & customer_summary["sla_status"].isin(selected_sla)
-                & customer_summary["assigned_to"].isin(selected_owner)
-            ].sort_values(by=["priority_score", "case_age_hours"], ascending=[False, False])
-
-            queue_columns = [
-                "customer_id", "case_count", "open_case_count", "last_updated", "message",
-                "complaint_topic", "emotion", "risk_score", "risk_level", "priority",
-                "sla_status", "coupon_status", "assigned_to", "status"
+            queue = customer_view.copy()
+            display_cols = [
+                "customer_id", "message", "complaint_topic", "emotion", "tone", "risk_score",
+                "risk_level", "priority", "sla_status", "status", "assigned_to", "coupon_status", "last_updated"
             ]
-            st.dataframe(filtered[queue_columns], use_container_width=True, hide_index=True)
-            st.download_button("Download Customer Queue CSV", filtered.to_csv(index=False).encode("utf-8"), "customer_priority_queue.csv", "text/csv")
+            st.dataframe(queue[display_cols].rename(columns={"message": "latest_issue"}), use_container_width=True, hide_index=True)
+            csv = queue.to_csv(index=False).encode("utf-8")
+            st.download_button("Download Customer Queue", data=csv, file_name="customer_priority_queue.csv", mime="text/csv")
 
         with tab2:
             st.subheader("Customer Review Workspace")
-            review_summary = customer_queue_summary(data)
-            selected_customer = st.selectbox(
+            options = customer_view.index.tolist()
+            selected_idx = st.selectbox(
                 "Select customer",
-                review_summary["customer_id"].tolist(),
-                format_func=lambda cid: (
-                    f"{cid} | "
-                    f"{review_summary[review_summary['customer_id'] == cid].iloc[0]['risk_level']} Risk | "
-                    f"{review_summary[review_summary['customer_id'] == cid].iloc[0]['risk_score']}% | "
-                    f"{review_summary[review_summary['customer_id'] == cid].iloc[0]['complaint_topic']}"
+                options,
+                format_func=lambda idx: (
+                    f"{clean_display(customer_view.loc[idx, 'customer_id'])} | "
+                    f"{clean_display(customer_view.loc[idx, 'risk_level'])} Risk | "
+                    f"{clean_display(customer_view.loc[idx, 'risk_score'])}% | "
+                    f"{clean_display(customer_view.loc[idx, 'complaint_topic'])}"
                 ),
             )
-            record = get_customer_representative_record(data, selected_customer)
+            record = customer_view.loc[selected_idx].to_dict()
 
-            st.markdown(
-                f"""
-                <div class="queue-card">
-                    <div class="case-title">{safe_text(record.get('customer_id',''))} · Customer Risk Profile</div>
-                    <div class="case-meta">Latest update: {safe_text(record.get('last_updated', ''))} · Representative case age: {safe_text(record.get('case_age_hours', ''))} hours</div>
-                    {priority_badge(record.get('priority','Low'))}
-                    {risk_badge(record.get('risk_level','Low'))}
-                    {sla_badge(record.get('sla_status','On Track'))}
-                    {badge(record.get('status','New'), 'blue')}
-                    {badge(record.get('complaint_topic','General Complaint'), 'purple')}
-                    {badge(record.get('assigned_to','Unassigned'), 'gray')}
-                    {badge(record.get('coupon_status','Not Required'), 'coupon')}
-                    <div class="case-message">Latest customer issue: {safe_text(record.get('message',''))}</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-            left, right = st.columns([1.05, 0.95], gap="large")
+            left, right = st.columns(2, gap="large")
             with left:
-                st.markdown('<div class="intel-card"><div class="ops-card-title">Case Summary</div>', unsafe_allow_html=True)
-                st.write(f"**Customer ID:** {record.get('customer_id', '')}")
-                st.write(f"**Latest Issue:** {record.get('message', '')}")
-                st.write(f"**Topic:** {record.get('complaint_topic', '')}")
-                st.write(f"**Risk Score:** {record.get('risk_score', '')}%")
-                st.write(f"**Risk Level:** {record.get('risk_level', '')}")
-                st.write(f"**Priority:** {record.get('priority', '')}")
-                st.write(f"**SLA:** {record.get('sla_status', '')}")
-                st.markdown('</div>', unsafe_allow_html=True)
+                st.markdown(
+                    """
+                    <div class="glass-card"><div class="section-title">Case Summary</div></div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                st.write(f"**Customer ID:** {clean_display(record.get('customer_id'))}")
+                st.write(f"**Latest Issue:** {clean_display(record.get('message'))}")
+                st.write(f"**Topic:** {clean_display(record.get('complaint_topic'))}")
+                st.write(f"**Risk Score:** {clean_display(record.get('risk_score'))}%")
+                st.write(f"**Risk Level:** {clean_display(record.get('risk_level'))}")
+                st.write(f"**Priority:** {clean_display(record.get('priority'))}")
+                st.write(f"**SLA:** {clean_display(record.get('sla_status'))}")
+                st.write(f"**Status:** {clean_display(record.get('status'))}")
+                st.write(f"**Assigned To:** {clean_display(record.get('assigned_to'))}")
 
             with right:
-                st.markdown('<div class="intel-card"><div class="ops-card-title">Internal Intelligence</div>', unsafe_allow_html=True)
-                st.write(f"**Emotion:** {record.get('emotion', '')}")
-                st.write(f"**Sarcasm:** {record.get('sarcasm_detected', 'No')}")
-                st.write(f"**Intent:** {record.get('customer_intent', '')}")
-                st.write(f"**Business Risk:** {record.get('business_risk', '')}")
-                st.write(f"**Risk Reason:** {record.get('risk_reason', '')}")
-                st.warning(record.get("recommended_action", "Review and follow up."))
-                st.markdown('</div>', unsafe_allow_html=True)
-
-            st.markdown("### Recovery Offer")
-            coupon_status = str(record.get("coupon_status", "Not Required"))
-            coupon_code = str(record.get("coupon_code", ""))
-            st.write(f"**Offer:** {record.get('coupon_offer', 'No coupon needed')}")
-            st.write(f"**Reason:** {record.get('coupon_reason', '')}")
-            if coupon_code:
-                st.code(coupon_code)
-
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                if coupon_status in ["Suggested", "Optional"] and st.button("Approve Coupon", key=f"approve_{record['case_id']}"):
-                    update_case_record(record["case_id"], {"coupon_status": "Approved", "resolution_action": f"Coupon approved: {coupon_code}"})
-                    st.rerun()
-            with c2:
-                if coupon_status in ["Suggested", "Optional"] and st.button("Reject Coupon", key=f"reject_{record['case_id']}"):
-                    update_case_record(record["case_id"], {"coupon_status": "Rejected", "resolution_action": "Coupon rejected by manager."})
-                    st.rerun()
-            with c3:
-                if coupon_status in ["Suggested", "Optional", "Approved"] and coupon_code and st.button("Mark Coupon Sent", key=f"sent_{record['case_id']}"):
-                    update_case_record(record["case_id"], {"coupon_status": "Sent", "resolution_action": f"Coupon sent: {coupon_code}", "status": "Resolved"})
-                    st.rerun()
+                st.markdown(
+                    """
+                    <div class="glass-card"><div class="section-title">Internal Intelligence</div></div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                st.write(f"**Emotion:** {clean_display(record.get('emotion'))}")
+                st.write(f"**Tone:** {clean_display(record.get('tone'))}")
+                st.write(f"**Sarcasm:** {clean_display(record.get('sarcasm'))}")
+                st.write(f"**Escalation Requested:** {clean_display(record.get('escalation_requested'))}")
+                st.write(f"**Intent:** {clean_display(record.get('customer_intent'))}")
+                st.write(f"**Business Risk:** {clean_display(record.get('business_risk'))}")
+                st.write(f"**Risk Reason:** {clean_display(record.get('risk_reason'))}")
+                st.warning(clean_display(record.get("recommended_action")))
 
             st.markdown("---")
-            st.caption("Status and owner controls were removed from Case Review to keep this screen focused on customer risk and recovery decisions.")
+            st.subheader("Manager-Only Recovery Offer")
+            coupon_status = clean_display(record.get("coupon_status"), "Not Required")
+            coupon_code = clean_display(record.get("coupon_code"), "")
+            coupon_offer = clean_display(record.get("coupon_offer"), "No coupon needed")
+            coupon_reason = clean_display(record.get("coupon_reason"), "")
+            case_id = clean_display(record.get("case_id"), "")
+
+            st.write(f"**Offer:** {coupon_offer}")
+            st.write(f"**Status:** {coupon_status}")
+            if coupon_code:
+                st.code(coupon_code)
+            if coupon_reason:
+                st.caption(coupon_reason)
+
+            if coupon_status in ["Suggested", "Optional"]:
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    if st.button("Approve Coupon", key=f"approve_{case_id}"):
+                        update_case_record(case_id, {"coupon_status": "Approved", "resolution_action": f"Coupon approved: {coupon_code}"})
+                        st.rerun()
+                with c2:
+                    if st.button("Reject Coupon", key=f"reject_{case_id}"):
+                        update_case_record(case_id, {"coupon_status": "Rejected", "resolution_action": "Coupon rejected by manager."})
+                        st.rerun()
+                with c3:
+                    if st.button("Mark Sent", key=f"sent_{case_id}"):
+                        update_case_record(case_id, {"coupon_status": "Sent", "status": "Resolved", "resolution_action": f"Coupon sent: {coupon_code}"})
+                        st.rerun()
+            elif coupon_status == "Approved":
+                if st.button("Mark Coupon Sent", key=f"sent_approved_{case_id}"):
+                    update_case_record(case_id, {"coupon_status": "Sent", "status": "Resolved", "resolution_action": f"Coupon sent: {coupon_code}"})
+                    st.rerun()
 
         with tab3:
             st.subheader("Coupon Center")
-            coupon_data = customer_queue_summary(data[data["coupon_status"].isin(["Suggested", "Optional", "Approved", "Sent", "Rejected"])])
+            coupon_data = data[data["coupon_status"].isin(["Suggested", "Optional", "Approved", "Sent", "Rejected"])]
             if len(coupon_data) == 0:
-                st.info("No coupon-related customers yet.")
+                st.info("No coupon-related cases yet.")
             else:
                 st.dataframe(
                     coupon_data[["customer_id", "complaint_topic", "risk_score", "risk_level", "coupon_offer", "coupon_code", "coupon_status", "status"]],
                     use_container_width=True,
                     hide_index=True,
                 )
-                c1, c2, c3, c4 = st.columns(4)
-                with c1: kpi_card("Suggested", len(data[data["coupon_status"] == "Suggested"]))
-                with c2: kpi_card("Approved", len(data[data["coupon_status"] == "Approved"]))
-                with c3: kpi_card("Sent", len(data[data["coupon_status"] == "Sent"]))
-                with c4: kpi_card("Rejected", len(data[data["coupon_status"] == "Rejected"]))
 
         with tab4:
             st.subheader("Analytics")
             a1, a2 = st.columns(2)
             with a1:
-                risk_table = customer_summary["risk_level"].value_counts().reset_index()
+                risk_table = customer_view["risk_level"].value_counts().reset_index()
                 risk_table.columns = ["Risk Level", "Customers"]
                 st.bar_chart(risk_table.set_index("Risk Level"))
             with a2:
-                status_table = customer_summary["status"].value_counts().reset_index()
-                status_table.columns = ["Status", "Customers"]
-                st.bar_chart(status_table.set_index("Status"))
-            a3, a4 = st.columns(2)
-            with a3:
-                topic_table = customer_summary["complaint_topic"].value_counts().reset_index()
-                topic_table.columns = ["Topic", "Customers"]
+                topic_table = data["complaint_topic"].value_counts().reset_index()
+                topic_table.columns = ["Topic", "Cases"]
                 st.bar_chart(topic_table.set_index("Topic"))
-            with a4:
-                owner_table = customer_summary["assigned_to"].value_counts().reset_index()
-                owner_table.columns = ["Owner", "Customers"]
-                st.bar_chart(owner_table.set_index("Owner"))
+
+            b1, b2 = st.columns(2)
+            with b1:
+                tone_table = data["tone"].value_counts().reset_index()
+                tone_table.columns = ["Tone", "Cases"]
+                st.bar_chart(tone_table.set_index("Tone"))
+            with b2:
+                status_table = data["status"].value_counts().reset_index()
+                status_table.columns = ["Status", "Cases"]
+                st.bar_chart(status_table.set_index("Status"))
+
             st.markdown("---")
-            if st.button("Re-analyze Existing Cases"):
-                count = reanalyze_existing_records()
-                st.success(f"Re-analyzed {count} cases with the latest emotion/risk rules.")
-                st.rerun()
             if st.button("Clear All Demo Data"):
                 clear_records_file()
                 st.session_state.records = []
-                st.session_state.active_case_id = ""
-                st.session_state.chat_messages = [{"role": "assistant", "content": "Hi, I’m your support assistant. What type of issue are you facing today?"}]
+                reset_chat(new_customer=False)
+                st.success("All demo data cleared.")
                 st.rerun()
 
 
 # ============================================================
-# Page 3: Journey Monitor
+# Page: Journey Monitor
 # ============================================================
 
 elif page == "Journey Monitor":
     if not check_manager_access():
         st.stop()
-    hero("Customer Emotion Journey", "Visualize how each customer’s emotion, topic, and risk evolve across support interactions.")
+
+    hero(
+        "Customer Emotion Journey",
+        "Visualize how each customer's emotion, topic, and risk changes across the support journey.",
+    )
+
     data = enrich_manager_data(prepare_dataframe(load_records()))
     if len(data) == 0:
         st.info("No customer journey available yet.")
     else:
-        data["timestamp_dt"] = pd.to_datetime(data["timestamp"], errors="coerce")
-        data = data.sort_values("timestamp_dt")
         selected_customer = st.selectbox("Select customer", sorted(data["customer_id"].dropna().unique().tolist()))
-        customer_data = data[data["customer_id"] == selected_customer].copy().sort_values("timestamp_dt")
-        latest = get_customer_representative_record(enrich_manager_data(customer_data), selected_customer)
+        customer_data = data[data["customer_id"] == selected_customer].copy().sort_values("last_updated_dt")
+        latest = customer_data.iloc[-1]
 
         c1, c2, c3, c4 = st.columns(4)
-        with c1: kpi_card("Current Emotion", latest.get("emotion", ""))
-        with c2: kpi_card("Current Risk", f"{latest.get('risk_score', '')}%")
-        with c3: kpi_card("Risk Level", latest.get("risk_level", ""))
-        with c4: kpi_card("Recovery", latest.get("coupon_status", ""))
+        with c1:
+            kpi_card("Latest Emotion", clean_display(latest.get("emotion")))
+        with c2:
+            kpi_card("Latest Tone", clean_display(latest.get("tone")))
+        with c3:
+            kpi_card("Latest Risk", f"{clean_display(latest.get('risk_score'))}%")
+        with c4:
+            kpi_card("Recovery Status", clean_display(latest.get("coupon_status")))
 
         st.markdown("---")
         st.subheader("Customer Emotion Journey")
-        all_events: List[Dict] = []
-        for _, row in customer_data.iterrows():
-            events = parse_emotion_journey(row.get("emotion_journey", ""))
-            if events:
-                all_events.extend(events)
-            else:
-                all_events.append({
-                    "time": str(row.get("timestamp", "")),
-                    "emotion": str(row.get("emotion", "")),
-                    "risk": str(row.get("risk_score", "")),
-                    "topic": str(row.get("complaint_topic", "")),
-                    "message": str(row.get("message", ""))[:70],
-                })
-        render_emotion_journey(all_events)
-        if all_events:
-            emotion_path = " → ".join([str(event.get("emotion", "")) for event in all_events if str(event.get("emotion", "")).strip()])
-            topic_path = " → ".join([str(event.get("topic", "")) for event in all_events if str(event.get("topic", "")).strip()])
-            st.markdown("### Emotion Path")
-            st.success(emotion_path)
-            st.markdown("### Topic Path")
-            st.info(topic_path)
+        emotion_path = str(latest.get("emotion_journey", "")) or " → ".join(customer_data["emotion"].astype(str).tolist())
+        emotions = [p.strip() for p in emotion_path.split("→") if p.strip()]
+        if emotions:
+            parts = []
+            for i, e in enumerate(emotions):
+                parts.append(f'<span class="path-pill">{safe_text(e)}</span>')
+                if i < len(emotions) - 1:
+                    parts.append('<span class="path-arrow">→</span>')
+            st.markdown(f'<div class="path-wrap">{"".join(parts)}</div>', unsafe_allow_html=True)
 
-        st.subheader("Journey Table")
-        st.dataframe(
-            customer_data[["timestamp", "message", "emotion", "complaint_topic", "risk_score", "risk_level", "coupon_status", "status"]],
-            use_container_width=True,
-            hide_index=True,
-        )
+        st.subheader("Topic Journey")
+        topic_path = str(latest.get("topic_journey", "")) or " → ".join(customer_data["complaint_topic"].astype(str).tolist())
+        topics = [p.strip() for p in topic_path.split("→") if p.strip()]
+        if topics:
+            parts = []
+            for i, t in enumerate(topics):
+                parts.append(f'<span class="path-pill">{safe_text(t)}</span>')
+                if i < len(topics) - 1:
+                    parts.append('<span class="path-arrow">→</span>')
+            st.markdown(f'<div class="path-wrap">{"".join(parts)}</div>', unsafe_allow_html=True)
+
+        st.subheader("Customer Timeline")
+        cols = ["last_updated", "message", "emotion", "tone", "complaint_topic", "risk_score", "risk_level", "status", "coupon_status"]
+        st.dataframe(customer_data[cols], use_container_width=True, hide_index=True)
 
         st.subheader("Risk Over Time")
-        chart_data = customer_data[["timestamp_dt", "risk_score"]].dropna().set_index("timestamp_dt")
-        if len(chart_data) > 0:
-            st.line_chart(chart_data)
+        risk_points = [int(x.strip()) for x in str(latest.get("risk_journey", "")).split("→") if x.strip().isdigit()]
+        if risk_points:
+            chart_df = pd.DataFrame({"step": list(range(1, len(risk_points) + 1)), "risk_score": risk_points}).set_index("step")
+            st.line_chart(chart_df)
         else:
-            st.info("Not enough data to show a risk chart yet.")
-
-        if st.button("Generate Journey Insight"):
-            st.warning(generate_journey_insight(selected_customer, customer_data))
+            chart_data = customer_data[["last_updated_dt", "risk_score"]].dropna().set_index("last_updated_dt")
+            if len(chart_data):
+                st.line_chart(chart_data)
 
 
 # ============================================================
-# Page 4: About
+# Page: About
 # ============================================================
 
 elif page == "About System":
-    hero("About VoiceOps AI Support Desk", "A guided AI support assistant with a customer-level operations dashboard for risk, workflow, and recovery offers.")
+    hero(
+        "About AI Support Recovery System",
+        "A customer support chatbot with private manager intelligence, escalation detection, sarcasm/rude tone detection, and recovery offer workflow.",
+    )
     st.markdown(
         """
         <div class="glass-card">
-            <div class="section-title">Project Summary</div>
+            <div class="section-title">What makes this system unique?</div>
             <div class="muted">
-                Customers chat with a guided support assistant. One conversation becomes one support case.
-                Managers review customers, not individual chat messages, and privately see risk, emotion,
-                ownership, SLA, and recovery actions.
+                It separates the customer experience from manager intelligence. Customers only see helpful support replies.
+                Managers privately see emotion, tone, risk, escalation requests, SLA status, and coupon recovery suggestions.
             </div>
         </div>
         """,
@@ -2175,24 +1676,26 @@ elif page == "About System":
     st.write(
         """
         Features:
-        - Guided support chatbot with message-specific replies
-        - New customer ID automatically starts a fresh conversation
-        - Customer-level priority queue
-        - Case review by customer ID and risk
-        - Internal intelligence without exposing customer transcript clutter
-        - Optional Gemini manager analysis
+        - Responsive customer chatbot
+        - Automatic new conversation when customer ID changes
+        - Greeting/small-talk handling
+        - Manager escalation detection
+        - Sarcasm and rude tone detection
         - Optional transformer emotion model
-        - Sarcasm-aware risk adjustment
-        - Visual customer emotion journey
-        - Coupon approval workflow kept private for managers
+        - Customer-level manager queue
+        - Manager-only coupon recovery workflow
+        - Customer emotion journey visualization
+        - Light/dark theme selector
         """
     )
-    st.subheader("Performance Design")
-    st.write(
-        """
-        The app runs fast by default using local rule-based analysis and optional Gemini API analysis.
-        Transformer models are disabled by default because they can slow down Streamlit Cloud.
-        You can enable them later using `ENABLE_TRANSFORMERS = "true"` in Streamlit Secrets and adding
-        `transformers` and `torch` to requirements.txt.
-        """
+
+    st.subheader("Optional transformer setup")
+    st.code(
+        """# requirements.txt optional additions
+transformers
+torch
+
+# Streamlit Secrets
+ENABLE_TRANSFORMERS = "true"
+EMOTION_MODEL = "j-hartmann/emotion-english-distilroberta-base"""
     )
