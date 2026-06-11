@@ -501,14 +501,41 @@ def detect_topic_rule(text: str, selected_issue_type: str = "Not sure yet") -> s
 
 
 def detect_emotion_rule(text: str) -> str:
+    """
+    Fast fallback emotion detector.
+    This is intentionally stronger than a basic sentiment rule so manager metrics
+    do not stay Neutral for clear complaints such as refund, missing package,
+    billing problem, or profanity.
+    """
     t = str(text).lower()
-    if any(w in t for w in ["angry", "furious", "mad", "worst", "terrible", "awful", "hate", "unacceptable", "ridiculous"]):
+
+    angry_words = [
+        "angry", "furious", "mad", "worst", "terrible", "awful", "hate",
+        "unacceptable", "ridiculous", "fuck", "shit", "damn", "useless",
+        "never buy", "scam", "fraud", "cheated"
+    ]
+    disappointed_words = [
+        "disappointed", "upset", "frustrated", "annoyed", "unhappy", "poor",
+        "bad experience", "not satisfied", "missing", "delayed", "late",
+        "refund", "money back", "charged", "billing", "broken", "damaged",
+        "wrong item", "not working", "no reply", "ignored", "nobody helped"
+    ]
+    confused_words = [
+        "confused", "unclear", "do not understand", "don't understand",
+        "why", "how", "what happened", "not sure", "where is", "cant find", "can't find"
+    ]
+    satisfied_words = [
+        "thank", "thanks", "appreciate", "great", "good", "excellent",
+        "resolved", "solved", "happy", "helpful"
+    ]
+
+    if any(w in t for w in angry_words):
         return "Angry"
-    if any(w in t for w in ["disappointed", "upset", "frustrated", "annoyed", "unhappy", "poor", "bad experience"]):
+    if any(w in t for w in disappointed_words):
         return "Disappointed"
-    if any(w in t for w in ["confused", "unclear", "do not understand", "don't understand", "why", "how", "what happened"]):
+    if any(w in t for w in confused_words):
         return "Confused"
-    if any(w in t for w in ["thank", "thanks", "appreciate", "great", "good", "excellent", "resolved", "solved", "happy"]):
+    if any(w in t for w in satisfied_words):
         return "Satisfied"
     return "Neutral"
 
@@ -753,6 +780,63 @@ def analyze_feedback(message: str, selected_issue_type: str, chat_history: Optio
         selected_issue_type=selected_issue_type,
     )
     return analysis
+
+
+def build_coupon_message(record: Dict) -> str:
+    """Message a manager can copy after approving a recovery coupon."""
+    code = str(record.get("coupon_code", "")).strip()
+    offer = str(record.get("coupon_offer", "customer recovery offer")).strip()
+    topic = str(record.get("complaint_topic", "your recent issue")).lower()
+
+    if not code:
+        return "No coupon code is available for this case."
+
+    return (
+        f"We’re sorry for the inconvenience with {topic}. "
+        f"As a goodwill gesture, we’d like to offer you {offer}. "
+        f"You can use this coupon code on your next order: {code}."
+    )
+
+
+def reanalyze_existing_records() -> int:
+    """Re-run local/Gemini analysis for existing demo rows after rule/model changes."""
+    records = load_records()
+    updated_count = 0
+
+    for record in records:
+        message = str(record.get("message", "")).strip()
+        if not message:
+            continue
+
+        conversation = str(record.get("conversation", ""))
+        fake_history = [{"role": "user", "content": conversation or message}]
+        analysis = analyze_feedback(message, "Not sure yet", fake_history)
+        coupon = suggest_recovery_coupon(
+            analysis["risk_level"],
+            analysis["risk_score"],
+            analysis["complaint_topic"],
+            str(record.get("case_id", create_case_id()))
+        )
+
+        for key in [
+            "clean_text", "analysis_source", "emotion", "sarcasm_detected",
+            "sarcasm_reason", "complaint_topic", "customer_intent", "business_risk",
+            "risk_score", "risk_level", "risk_reason", "recommended_action", "customer_reply"
+        ]:
+            record[key] = analysis[key]
+
+        if str(record.get("coupon_status", "")) not in ["Approved", "Sent", "Rejected"]:
+            record["coupon_offer"] = coupon["coupon_offer"]
+            record["coupon_code"] = coupon["coupon_code"]
+            record["coupon_status"] = coupon["coupon_status"]
+            record["coupon_reason"] = coupon["coupon_reason"]
+
+        record["last_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        updated_count += 1
+
+    save_records(records)
+    st.session_state.records = records
+    return updated_count
 
 
 # ============================================================
@@ -1002,59 +1086,108 @@ if st.session_state.get("manager_authenticated", False):
 if page == "AI Support Chat":
     hero("AI Support Chat", "A guided support assistant that creates one case per conversation and gives message-specific replies.")
 
-    left, right = st.columns([1.45, 0.75], gap="large")
+    top_left, top_right = st.columns([1.05, 0.95], gap="large")
 
-    with right:
-        st.markdown('<div class="glass-card"><div class="section-title">Customer Context</div><div class="muted">These details help route the case to the right team.</div></div>', unsafe_allow_html=True)
-        st.session_state.chat_customer_id = st.text_input("Customer ID or Order ID", value=st.session_state.chat_customer_id, placeholder="Example: C001 or ORD123")
-        st.session_state.selected_issue_type = st.selectbox("Issue Type", ISSUE_TYPES, index=ISSUE_TYPES.index(st.session_state.selected_issue_type))
-
-        if st.session_state.active_case_id:
-            st.info(f"Active case: {st.session_state.active_case_id}")
-
+    with top_left:
         st.markdown(
             """
             <div class="glass-card">
                 <div class="section-title">Smart Support Flow</div>
-                <p class="muted">1. Choose an issue type if known.</p>
-                <p class="muted">2. Chat naturally with the assistant.</p>
-                <p class="muted">3. The full conversation updates one case.</p>
-                <p class="muted">4. Managers privately see risk, SLA, and coupon suggestions.</p>
+                <p class="muted"><b>1.</b> Choose an issue type if you know it.</p>
+                <p class="muted"><b>2.</b> Chat naturally with the assistant.</p>
+                <p class="muted"><b>3.</b> The full conversation updates one support case.</p>
+                <p class="muted"><b>4.</b> Managers privately see emotion, risk, SLA, and coupon suggestions.</p>
             </div>
             """,
             unsafe_allow_html=True,
         )
 
+        st.markdown(
+            """
+            <div class="glass-card">
+                <div class="section-title">Coupon Recovery Logic</div>
+                <p class="muted">Coupons are <b>not shown automatically</b> to customers.</p>
+                <p class="muted">High-risk cases may receive a suggested recovery offer in the manager dashboard.</p>
+                <p class="muted">The manager can approve, reject, or mark the coupon as sent.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with top_right:
+        st.markdown(
+            '<div class="glass-card"><div class="section-title">Customer Context</div><div class="muted">These details help route the case to the right team.</div></div>',
+            unsafe_allow_html=True,
+        )
+        st.session_state.chat_customer_id = st.text_input(
+            "Customer ID or Order ID",
+            value=st.session_state.chat_customer_id,
+            placeholder="Example: C001 or ORD123",
+        )
+        st.session_state.selected_issue_type = st.selectbox(
+            "Issue Type",
+            ISSUE_TYPES,
+            index=ISSUE_TYPES.index(st.session_state.selected_issue_type),
+        )
+
+        if st.session_state.active_case_id:
+            st.info(f"Active case: {st.session_state.active_case_id}")
+
         if st.button("Start New Chat"):
-            st.session_state.chat_messages = [{"role": "assistant", "content": "Hi, I’m your support assistant. What type of issue are you facing today?"}]
+            st.session_state.chat_messages = [
+                {
+                    "role": "assistant",
+                    "content": "Hi, I’m your support assistant. What type of issue are you facing today?",
+                }
+            ]
             st.session_state.active_case_id = ""
             st.session_state.selected_issue_type = "Not sure yet"
             st.rerun()
 
-    with left:
-        st.markdown('<div class="glass-card"><div class="section-title">Support Conversation</div><div class="muted">Every message updates the same support case until you start a new chat.</div></div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="glass-card"><div class="section-title">Support Conversation</div><div class="muted">Every message updates the same support case until you start a new chat.</div></div>',
+        unsafe_allow_html=True,
+    )
 
-        for chat in st.session_state.chat_messages:
-            with st.chat_message(chat["role"]):
-                st.write(chat["content"])
+    for chat in st.session_state.chat_messages:
+        with st.chat_message(chat["role"]):
+            st.write(chat["content"])
 
-        user_message = st.chat_input("Type your message here...")
-        if user_message:
+    # Use a normal form instead of st.chat_input so the input stays exactly under the conversation.
+    with st.form("support_message_form", clear_on_submit=True):
+        user_message = st.text_input("Message", placeholder="Type your message here...")
+        send_clicked = st.form_submit_button("Send Message")
+
+    if send_clicked:
+        if user_message.strip() == "":
+            st.warning("Please type a message before sending.")
+        else:
             st.session_state.chat_messages.append({"role": "user", "content": user_message})
-            with st.chat_message("user"):
-                st.write(user_message)
 
             with st.spinner("Reviewing message..."):
-                analysis = analyze_feedback(user_message, st.session_state.selected_issue_type, st.session_state.chat_messages)
+                analysis = analyze_feedback(
+                    user_message,
+                    st.session_state.selected_issue_type,
+                    st.session_state.chat_messages,
+                )
                 case_id = get_active_case_id()
-                coupon = suggest_recovery_coupon(analysis["risk_level"], analysis["risk_score"], analysis["complaint_topic"], case_id)
+                coupon = suggest_recovery_coupon(
+                    analysis["risk_level"],
+                    analysis["risk_score"],
+                    analysis["complaint_topic"],
+                    case_id,
+                )
                 assistant_reply = analysis["customer_reply"]
                 st.session_state.chat_messages.append({"role": "assistant", "content": assistant_reply})
-                case_id = create_or_update_active_case(st.session_state.chat_customer_id, user_message, analysis, coupon)
+                case_id = create_or_update_active_case(
+                    st.session_state.chat_customer_id,
+                    user_message,
+                    analysis,
+                    coupon,
+                )
 
-            with st.chat_message("assistant"):
-                st.write(assistant_reply)
-                st.caption(f"Support case: {case_id}")
+            st.success(f"Message saved to support case: {case_id}")
+            st.rerun()
 
 
 # ============================================================
@@ -1168,6 +1301,12 @@ elif page == "Manager Command Center":
             st.write(f"**Reason:** {record.get('coupon_reason', '')}")
             if coupon_code:
                 st.code(coupon_code)
+                st.text_area(
+                    "Copy this message after approving the coupon",
+                    value=build_coupon_message(record),
+                    height=110,
+                    disabled=True,
+                )
 
             c1, c2, c3 = st.columns(3)
             with c1:
@@ -1204,6 +1343,19 @@ elif page == "Manager Command Center":
 
         with tab3:
             st.subheader("Coupon Center")
+            st.markdown(
+                """
+                <div class="glass-card">
+                    <div class="section-title">How to give a coupon</div>
+                    <p class="muted"><b>Step 1:</b> Open a high-risk case in Case Review.</p>
+                    <p class="muted"><b>Step 2:</b> Read the coupon reason and recovery offer.</p>
+                    <p class="muted"><b>Step 3:</b> Click <b>Approve Coupon</b> if the offer is suitable.</p>
+                    <p class="muted"><b>Step 4:</b> Copy the coupon message and send it through your support channel.</p>
+                    <p class="muted"><b>Step 5:</b> Click <b>Mark Coupon Sent</b> to resolve the case.</p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
             coupon_data = data[data["coupon_status"].isin(["Suggested", "Optional", "Approved", "Sent", "Rejected"])]
             if len(coupon_data) == 0:
                 st.info("No coupon-related cases yet.")
@@ -1236,6 +1388,11 @@ elif page == "Manager Command Center":
                 owner_table.columns = ["Owner", "Cases"]
                 st.bar_chart(owner_table.set_index("Owner"))
             st.markdown("---")
+            if st.button("Re-analyze Existing Cases"):
+                count = reanalyze_existing_records()
+                st.success(f"Re-analyzed {count} cases with the latest emotion/risk rules.")
+                st.rerun()
+
             if st.button("Clear All Demo Data"):
                 clear_records_file()
                 st.session_state.records = []
