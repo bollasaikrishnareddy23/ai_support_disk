@@ -482,21 +482,29 @@ def clean_text(text: str) -> str:
 
 
 def detect_topic_rule(text: str, selected_issue_type: str = "Not sure yet") -> str:
-    if selected_issue_type and selected_issue_type != "Not sure yet":
-        return selected_issue_type
+    """
+    Detect the topic from the actual message first.
+    The issue-type dropdown is only a hint. It should not force every message
+    into that topic, because greetings like "hai" should not become Product Issue.
+    """
+    t = str(text).lower().strip()
 
-    t = str(text).lower()
     topic_keywords = {
         "Refund Issue": ["refund", "money back", "return", "chargeback", "cancel payment"],
-        "Delivery Issue": ["delivery", "shipping", "shipment", "late", "delay", "package", "tracking", "arrived", "delivered"],
+        "Delivery Issue": ["delivery", "shipping", "shipment", "late", "delay", "package", "tracking", "arrived", "delivered", "missing parcel", "missing package", "where is my order"],
         "Billing Issue": ["charged", "payment", "billing", "bill", "invoice", "paid", "card", "transaction", "charged twice"],
-        "Product Issue": ["broken", "damaged", "defective", "faulty", "quality", "product", "item", "replacement"],
+        "Product Issue": ["broken", "damaged", "defective", "faulty", "quality", "product", "item", "replacement", "wrong item"],
         "Customer Service Issue": ["support", "customer service", "agent", "no reply", "ignored", "nobody helped", "rude"],
         "Technical Issue": ["app", "website", "login", "password", "error", "crash", "bug", "not working", "reset"],
     }
+
     for topic, words in topic_keywords.items():
         if any(word in t for word in words):
             return topic
+
+    if selected_issue_type and selected_issue_type != "Not sure yet":
+        return selected_issue_type
+
     return "General Complaint"
 
 
@@ -615,6 +623,37 @@ def calculate_risk(emotion: str, topic: str, text: str, sarcastic: bool) -> Tupl
 # Dynamic Reply Generator
 # ============================================================
 
+def get_smalltalk_reply(message: str) -> Optional[str]:
+    """
+    Handle greetings and small-talk before analysis/case creation.
+    These messages should not create a support case and should not be classified
+    as product/refund/delivery issues.
+    """
+    t = clean_text(message)
+
+    greetings = {
+        "hi", "hai", "hello", "hey", "hii", "helo", "good morning",
+        "good afternoon", "good evening", "yo"
+    }
+    thanks = {"thanks", "thank you", "thankyou", "ty", "ok thanks", "okay thanks"}
+    bye = {"bye", "goodbye", "see you", "thank you bye", "thanks bye"}
+
+    if t in greetings:
+        return "Hi! How can I help you today? You can tell me about a delivery, refund, billing, product, technical, or support issue."
+
+    if t in thanks:
+        return "You’re welcome. If you have more details about the issue, you can send them here."
+
+    if t in bye:
+        return "Thank you for contacting support. Have a good day."
+
+    # Profanity without an actual issue: acknowledge frustration and ask for the problem.
+    if t in {"fuck you", "shit", "damn", "stupid", "idiot"}:
+        return "I’m sorry you’re upset. Please tell me what went wrong so I can record the issue properly for the team."
+
+    return None
+
+
 def looks_like_reference(text: str) -> bool:
     value = str(text).strip()
     if len(value) < 3 or len(value) > 30:
@@ -724,10 +763,17 @@ def normalize_analysis(result: Dict, fallback: Dict) -> Dict:
     if topic not in allowed_topics:
         topic = fallback["complaint_topic"]
 
+    # Do not let Gemini downgrade clear complaint signals to Neutral.
+    if fallback.get("emotion") in ["Angry", "Disappointed", "Confused"] and emotion == "Neutral":
+        emotion = fallback["emotion"]
+
     try:
         risk_score = int(result.get("risk_score", fallback["risk_score"]))
     except Exception:
         risk_score = fallback["risk_score"]
+
+    # Do not let Gemini reduce a locally detected risk signal.
+    risk_score = max(risk_score, int(fallback.get("risk_score", 0)))
     risk_score = max(0, min(risk_score, 100))
 
     return {
@@ -746,6 +792,26 @@ def normalize_analysis(result: Dict, fallback: Dict) -> Dict:
 
 def analyze_feedback(message: str, selected_issue_type: str, chat_history: Optional[List[Dict]]) -> Dict:
     cleaned = clean_text(message)
+
+    smalltalk_reply = get_smalltalk_reply(message)
+    if smalltalk_reply is not None:
+        return {
+            "clean_text": cleaned,
+            "analysis_source": "Small talk handler",
+            "emotion": "Neutral",
+            "sarcasm_detected": "No",
+            "sarcasm_reason": "Small-talk message; no complaint detected.",
+            "complaint_topic": "General Complaint",
+            "customer_intent": "Customer is greeting or using small talk.",
+            "business_risk": "No business risk detected because no issue was described.",
+            "risk_score": 0,
+            "risk_level": "Low",
+            "risk_reason": "Greeting or small-talk message only.",
+            "recommended_action": "No manager action needed unless the customer describes an issue.",
+            "customer_reply": smalltalk_reply,
+            "actionable_case": False,
+        }
+
     topic = detect_topic_rule(cleaned, selected_issue_type)
     emotion_rule = detect_emotion_rule(cleaned)
     emotion, emotion_source = detect_emotion_optional_transformer(message, emotion_rule)
@@ -766,6 +832,7 @@ def analyze_feedback(message: str, selected_issue_type: str, chat_history: Optio
         "risk_level": risk_level,
         "risk_reason": risk_reason,
         "recommended_action": "Review the case, assign the correct team, and follow up if the risk is medium or high.",
+        "actionable_case": True,
     }
 
     gemini_result = analyze_with_gemini(message, topic, chat_history)
@@ -1096,19 +1163,7 @@ if page == "AI Support Chat":
                 <p class="muted"><b>1.</b> Choose an issue type if you know it.</p>
                 <p class="muted"><b>2.</b> Chat naturally with the assistant.</p>
                 <p class="muted"><b>3.</b> The full conversation updates one support case.</p>
-                <p class="muted"><b>4.</b> Managers privately see emotion, risk, SLA, and coupon suggestions.</p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        st.markdown(
-            """
-            <div class="glass-card">
-                <div class="section-title">Coupon Recovery Logic</div>
-                <p class="muted">Coupons are <b>not shown automatically</b> to customers.</p>
-                <p class="muted">High-risk cases may receive a suggested recovery offer in the manager dashboard.</p>
-                <p class="muted">The manager can approve, reject, or mark the coupon as sent.</p>
+                <p class="muted"><b>4.</b> Managers privately see emotion, risk, SLA, and recovery actions.</p>
             </div>
             """,
             unsafe_allow_html=True,
@@ -1170,23 +1225,28 @@ if page == "AI Support Chat":
                     st.session_state.selected_issue_type,
                     st.session_state.chat_messages,
                 )
-                case_id = get_active_case_id()
-                coupon = suggest_recovery_coupon(
-                    analysis["risk_level"],
-                    analysis["risk_score"],
-                    analysis["complaint_topic"],
-                    case_id,
-                )
                 assistant_reply = analysis["customer_reply"]
                 st.session_state.chat_messages.append({"role": "assistant", "content": assistant_reply})
-                case_id = create_or_update_active_case(
-                    st.session_state.chat_customer_id,
-                    user_message,
-                    analysis,
-                    coupon,
-                )
 
-            st.success(f"Message saved to support case: {case_id}")
+                if not analysis.get("actionable_case", True):
+                    case_id = ""
+                else:
+                    case_id = get_active_case_id()
+                    coupon = suggest_recovery_coupon(
+                        analysis["risk_level"],
+                        analysis["risk_score"],
+                        analysis["complaint_topic"],
+                        case_id,
+                    )
+                    case_id = create_or_update_active_case(
+                        st.session_state.chat_customer_id,
+                        user_message,
+                        analysis,
+                        coupon,
+                    )
+
+            if case_id:
+                st.success(f"Message saved to support case: {case_id}")
             st.rerun()
 
 
