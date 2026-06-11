@@ -1,0 +1,27 @@
+DELIVERY ISSUE
+Customer: My package was supposed to arrive three days ago, but I still have no update.
+Customer: ORD123
+Customer: This happened last month too.
+
+REFUND ISSUE
+Customer: I want a refund. The product I received is completely different from what I ordered.
+Customer: Nobody replied to my previous email either.
+
+BILLING ISSUE
+Customer: I was charged twice for the same order.
+Customer: This is unacceptable. I need my money back.
+
+PRODUCT ISSUE
+Customer: The item arrived broken and the box was damaged.
+Customer: I want a replacement, not a refund.
+
+TECHNICAL ISSUE
+Customer: I cannot log in to my account. The app keeps showing an error.
+Customer: It happens every time I reset my password.
+
+SARCASM EXAMPLE
+Customer: Great service, my package is only 10 days late. Amazing.
+
+HIGH-RISK COMPLAINT
+Customer: This is the worst service ever. Nobody helped me and I want my money back immediately.
+Customer: If this is not solved today, I will never buy from you again.
