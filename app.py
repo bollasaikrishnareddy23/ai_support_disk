@@ -481,30 +481,80 @@ def clean_text(text: str) -> str:
     return text
 
 
-def detect_topic_rule(text: str, selected_issue_type: str = "Not sure yet") -> str:
+def detect_topic_rule(text: str, selected_issue_type: str = "Not sure yet", chat_history: Optional[List[Dict]] = None) -> str:
     """
-    Detect the topic from the actual message first.
-    The issue-type dropdown is only a hint. It should not force every message
-    into that topic, because greetings like "hai" should not become Product Issue.
+    Detect the topic from the current message and recent chat context.
+    The issue-type dropdown is only a weak hint; it should not override clear
+    intent from the customer message or conversation.
     """
     t = str(text).lower().strip()
+    words = t.split()
 
-    topic_keywords = {
-        "Refund Issue": ["refund", "money back", "return", "chargeback", "cancel payment"],
-        "Delivery Issue": ["delivery", "shipping", "shipment", "late", "delay", "package", "tracking", "arrived", "delivered", "missing parcel", "missing package", "where is my order"],
-        "Billing Issue": ["charged", "payment", "billing", "bill", "invoice", "paid", "card", "transaction", "charged twice"],
-        "Product Issue": ["broken", "damaged", "defective", "faulty", "quality", "product", "item", "replacement", "wrong item"],
-        "Customer Service Issue": ["support", "customer service", "agent", "no reply", "ignored", "nobody helped", "rude"],
-        "Technical Issue": ["app", "website", "login", "password", "error", "crash", "bug", "not working", "reset"],
-    }
+    # Strong delivery/order-status patterns must be checked before generic
+    # product words. Customers often say "where is my product" when they mean
+    # delivery/tracking, not product quality.
+    delivery_phrases = [
+        "where is my product", "where is my item", "where is my order",
+        "where is my package", "where is my parcel", "missing package",
+        "missing parcel", "package missing", "product missing",
+        "not received", "did not receive", "haven't received", "have not received",
+        "when will it arrive", "when arrive", "arrival date", "possible date",
+        "expected date", "delivery date", "eta", "tracking", "shipment",
+        "shipping", "delayed", "delay", "late delivery", "out for delivery"
+    ]
+    if any(p in t for p in delivery_phrases):
+        return "Delivery Issue"
 
-    for topic, words in topic_keywords.items():
-        if any(word in t for word in words):
-            return topic
+    if any(p in t for p in ["refund", "money back", "return my money", "chargeback"]):
+        return "Refund Issue"
 
-    if selected_issue_type and selected_issue_type != "Not sure yet":
+    if any(p in t for p in ["charged", "payment", "billing", "bill", "invoice", "paid", "card", "transaction", "charged twice"]):
+        return "Billing Issue"
+
+    if any(p in t for p in ["broken", "damaged", "defective", "faulty", "quality", "wrong item", "replacement", "not working product"]):
+        return "Product Issue"
+
+    if any(p in t for p in ["support", "customer service", "agent", "no reply", "ignored", "nobody helped", "rude", "no one helped"]):
+        return "Customer Service Issue"
+
+    if any(p in t for p in ["app", "website", "login", "password", "error", "crash", "bug", "reset link", "technical", "otp"]):
+        return "Technical Issue"
+
+    # Short follow-up questions should inherit the previous conversation topic
+    # instead of being forced by the dropdown.
+    if len(words) <= 5:
+        context_topic = infer_topic_from_history(chat_history)
+        if context_topic != "General Complaint":
+            return context_topic
+
+    if selected_issue_type and selected_issue_type != "Not sure yet" and len(words) > 5:
         return selected_issue_type
 
+    return "General Complaint"
+
+
+def infer_topic_from_history(chat_history: Optional[List[Dict]]) -> str:
+    """Infer the current issue topic from recent customer messages."""
+    if not chat_history:
+        return "General Complaint"
+    recent_user_text = " ".join(
+        str(item.get("content", ""))
+        for item in chat_history[-8:]
+        if item.get("role") == "user"
+    ).lower()
+    # Avoid recursion by using direct patterns only.
+    if any(p in recent_user_text for p in ["where is", "package", "parcel", "order", "shipment", "shipping", "delivery", "tracking", "arrive", "delayed", "missing"]):
+        return "Delivery Issue"
+    if any(p in recent_user_text for p in ["refund", "money back", "return my money", "chargeback"]):
+        return "Refund Issue"
+    if any(p in recent_user_text for p in ["charged", "payment", "billing", "invoice", "card", "paid"]):
+        return "Billing Issue"
+    if any(p in recent_user_text for p in ["broken", "damaged", "defective", "faulty", "wrong item", "replacement"]):
+        return "Product Issue"
+    if any(p in recent_user_text for p in ["login", "password", "app", "website", "error", "bug", "crash"]):
+        return "Technical Issue"
+    if any(p in recent_user_text for p in ["support", "agent", "no reply", "ignored", "nobody helped", "rude"]):
+        return "Customer Service Issue"
     return "General Complaint"
 
 
@@ -520,7 +570,7 @@ def detect_emotion_rule(text: str) -> str:
     angry_words = [
         "angry", "furious", "mad", "worst", "terrible", "awful", "hate",
         "unacceptable", "ridiculous", "fuck", "shit", "damn", "useless",
-        "never buy", "scam", "fraud", "cheated"
+        "never buy", "scam", "fraud", "cheated", "asshole", "bastard", "fuck off"
     ]
     disappointed_words = [
         "disappointed", "upset", "frustrated", "annoyed", "unhappy", "poor",
@@ -530,7 +580,7 @@ def detect_emotion_rule(text: str) -> str:
     ]
     confused_words = [
         "confused", "unclear", "do not understand", "don't understand",
-        "why", "how", "what happened", "not sure", "where is", "cant find", "can't find"
+        "why", "how", "what happened", "not sure", "where is", "cant find", "can't find", "possible date", "eta", "when arrive", "delivery date"
     ]
     satisfied_words = [
         "thank", "thanks", "appreciate", "great", "good", "excellent",
@@ -623,11 +673,20 @@ def calculate_risk(emotion: str, topic: str, text: str, sarcastic: bool) -> Tupl
 # Dynamic Reply Generator
 # ============================================================
 
+def is_abusive_only(message: str) -> bool:
+    """True when the message is only abuse/profanity and no actual issue details."""
+    t = clean_text(message)
+    abusive_only = {
+        "fuck", "fuck you", "fuck off", "shit", "damn", "stupid",
+        "idiot", "asshole", "bastard", "moron", "nonsense"
+    }
+    return t in abusive_only
+
+
 def get_smalltalk_reply(message: str) -> Optional[str]:
     """
-    Handle greetings and small-talk before analysis/case creation.
-    These messages should not create a support case and should not be classified
-    as product/refund/delivery issues.
+    Handle greetings and thanks before case creation.
+    These messages should not create a support case.
     """
     t = clean_text(message)
 
@@ -639,17 +698,16 @@ def get_smalltalk_reply(message: str) -> Optional[str]:
     bye = {"bye", "goodbye", "see you", "thank you bye", "thanks bye"}
 
     if t in greetings:
-        return "Hi! How can I help you today? You can tell me about a delivery, refund, billing, product, technical, or support issue."
+        return (
+            "Hi! I’m here to help. Tell me what happened, or choose an issue type like "
+            "delivery, refund, billing, product, technical, or support."
+        )
 
     if t in thanks:
-        return "You’re welcome. If you have more details about the issue, you can send them here."
+        return "You’re welcome. Send any extra details here if you want the team to review them."
 
     if t in bye:
         return "Thank you for contacting support. Have a good day."
-
-    # Profanity without an actual issue: acknowledge frustration and ask for the problem.
-    if t in {"fuck you", "shit", "damn", "stupid", "idiot"}:
-        return "I’m sorry you’re upset. Please tell me what went wrong so I can record the issue properly for the team."
 
     return None
 
@@ -661,9 +719,20 @@ def looks_like_reference(text: str) -> bool:
     return bool(re.search(r"[A-Za-z].*\d|\d.*[A-Za-z]", value)) or value.isdigit()
 
 
-def build_customer_reply(message: str, topic: str, risk_level: str, emotion: str, selected_issue_type: str) -> str:
+def build_customer_reply(
+    message: str,
+    topic: str,
+    risk_level: str,
+    emotion: str,
+    selected_issue_type: str,
+    chat_history: Optional[List[Dict]] = None,
+) -> str:
+    """Create a customer-facing reply that is specific to the current message and context."""
     raw = str(message).strip()
     t = raw.lower()
+    short = len(raw.split()) <= 5
+    context_topic = infer_topic_from_history(chat_history)
+    effective_topic = topic if topic != "General Complaint" else context_topic
 
     if looks_like_reference(raw):
         return (
@@ -671,28 +740,71 @@ def build_customer_reply(message: str, topic: str, risk_level: str, emotion: str
             "Our team can use it to review the issue more accurately."
         )
 
-    if len(raw.split()) <= 3 and topic == "General Complaint":
-        return "Thanks. Could you describe what happened in a little more detail so I can record the issue properly?"
+    # Context-aware follow-up replies.
+    eta_words = ["possible date", "date", "when", "arrive", "arrival", "eta", "expected"]
+    if any(w in t for w in eta_words) and effective_topic == "Delivery Issue":
+        return (
+            "I understand you want the expected delivery date. I can’t see live tracking from here, "
+            "but I’ve added your request for an ETA to the case so the team can check the shipment status and update you."
+        )
 
+    if any(w in t for w in ["status", "update", "any update", "what happened"]) and effective_topic != "General Complaint":
+        return (
+            "I’ve added your request for an update to the support case. "
+            "The team will review the latest details and follow up with the next step."
+        )
+
+    # If the customer is upset but has already given an issue, de-escalate and confirm the case.
     angry_prefix = "I’m sorry for the frustrating experience. " if risk_level == "High" or emotion == "Angry" else ""
 
-    if topic == "Delivery Issue":
-        return angry_prefix + "I’ve recorded this as a delivery issue so the team can check the shipment status, delay reason, and next update."
-    if topic == "Refund Issue":
-        return angry_prefix + "I’ve recorded your refund concern so the team can review the order and follow up with the next steps."
-    if topic == "Billing Issue":
-        return angry_prefix + "I’ve recorded this billing concern so the team can review the charge or payment details carefully."
-    if topic == "Product Issue":
-        return angry_prefix + "I’ve recorded this product issue so the team can review the item condition and possible replacement or support options."
-    if topic == "Technical Issue":
-        return angry_prefix + "I’ve recorded this technical issue so the team can review the error and check what is causing the problem."
-    if topic == "Customer Service Issue":
-        return angry_prefix + "I’ve recorded this as a support experience issue so the team can review the previous response and follow up properly."
+    if effective_topic == "Delivery Issue":
+        if any(p in t for p in ["where is", "missing", "not received", "haven't received", "have not received"]):
+            return angry_prefix + (
+                "I’ve recorded this as a missing or delayed delivery issue. "
+                "The team can check the shipment status, tracking details, and next update."
+            )
+        return angry_prefix + (
+            "I’ve recorded this as a delivery issue so the team can check the shipment status, delay reason, and next update."
+        )
+
+    if effective_topic == "Refund Issue":
+        return angry_prefix + (
+            "I’ve recorded your refund concern so the team can review the order and follow up with the next steps."
+        )
+
+    if effective_topic == "Billing Issue":
+        return angry_prefix + (
+            "I’ve recorded this billing concern so the team can review the charge or payment details carefully."
+        )
+
+    if effective_topic == "Product Issue":
+        return angry_prefix + (
+            "I’ve recorded this product issue so the team can review the item condition and possible replacement or support options."
+        )
+
+    if effective_topic == "Technical Issue":
+        return angry_prefix + (
+            "I’ve recorded this technical issue so the team can review the error and check what is causing the problem."
+        )
+
+    if effective_topic == "Customer Service Issue":
+        return angry_prefix + (
+            "I’ve recorded this as a support experience issue so the team can review the previous response and follow up properly."
+        )
+
+    # Do not create vague robotic replies for very short unclear messages.
+    if short:
+        return (
+            "I can help with that. Could you tell me what happened and whether it is about delivery, refund, billing, product, technical, or support?"
+        )
 
     if "thank" in t or "thanks" in t:
         return "Thank you for sharing that. I’ve recorded your feedback for the team."
 
-    return "Thank you for explaining. I’ve recorded your message as a support case so our team can review it."
+    return (
+        "Thank you for explaining. I’ve recorded your message as a support case so our team can review it."
+    )
+
 
 
 # ============================================================
@@ -812,7 +924,43 @@ def analyze_feedback(message: str, selected_issue_type: str, chat_history: Optio
             "actionable_case": False,
         }
 
-    topic = detect_topic_rule(cleaned, selected_issue_type)
+    if is_abusive_only(message):
+        context_topic = infer_topic_from_history(chat_history)
+        if context_topic != "General Complaint":
+            return {
+                "clean_text": cleaned,
+                "analysis_source": "Abuse/context handler",
+                "emotion": "Angry",
+                "sarcasm_detected": "No",
+                "sarcasm_reason": "No sarcasm pattern detected.",
+                "complaint_topic": context_topic,
+                "customer_intent": "Customer is angry and wants the existing issue handled urgently.",
+                "business_risk": "High escalation risk because the customer is using abusive language after reporting an issue.",
+                "risk_score": 88,
+                "risk_level": "High",
+                "risk_reason": "Abusive language detected in an existing support context.",
+                "recommended_action": "Manager or support lead should review and follow up quickly.",
+                "customer_reply": "I’m sorry you’re upset. I’ve updated your existing case as urgent so the team can review it more carefully.",
+                "actionable_case": True,
+            }
+        return {
+            "clean_text": cleaned,
+            "analysis_source": "Abuse handler",
+            "emotion": "Angry",
+            "sarcasm_detected": "No",
+            "sarcasm_reason": "No sarcasm pattern detected.",
+            "complaint_topic": "General Complaint",
+            "customer_intent": "Customer is upset but has not described the issue yet.",
+            "business_risk": "No actionable issue yet, but customer tone is negative.",
+            "risk_score": 0,
+            "risk_level": "Low",
+            "risk_reason": "Abusive-only message without issue details.",
+            "recommended_action": "No manager action needed unless the customer describes the issue.",
+            "customer_reply": "I’m sorry you’re upset. I can help record the problem for our team, but I need a little detail about what went wrong.",
+            "actionable_case": False,
+        }
+
+    topic = detect_topic_rule(cleaned, selected_issue_type, chat_history)
     emotion_rule = detect_emotion_rule(cleaned)
     emotion, emotion_source = detect_emotion_optional_transformer(message, emotion_rule)
     sarcastic, sarcasm_reason = detect_sarcasm_rule(message)
@@ -845,6 +993,7 @@ def analyze_feedback(message: str, selected_issue_type: str, chat_history: Optio
         risk_level=analysis["risk_level"],
         emotion=analysis["emotion"],
         selected_issue_type=selected_issue_type,
+        chat_history=chat_history,
     )
     return analysis
 
@@ -1519,7 +1668,21 @@ if st.session_state.get("manager_authenticated", False):
 if page == "AI Support Chat":
     hero("AI Support Chat", "A guided support assistant that creates one case per customer conversation and gives message-specific replies.")
 
-    context_col, flow_col = st.columns([1.0, 1.0], gap="large")
+    flow_col, context_col = st.columns([1.0, 1.0], gap="large")
+
+    with flow_col:
+        st.markdown(
+            """
+            <div class="ops-grid-card">
+                <div class="ops-card-title">Smart Support Flow</div>
+                <div class="flow-step"><div class="flow-num">1</div><div class="flow-text">Greet the customer and understand the issue.</div></div>
+                <div class="flow-step"><div class="flow-num">2</div><div class="flow-text">Use the issue type only as a hint, not a forced category.</div></div>
+                <div class="flow-step"><div class="flow-num">3</div><div class="flow-text">One customer conversation updates one active support case.</div></div>
+                <div class="flow-step"><div class="flow-num">4</div><div class="flow-text">Managers privately see risk, emotion, routing, and recovery actions.</div></div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
     with context_col:
         st.markdown(
@@ -1551,20 +1714,6 @@ if page == "AI Support Chat":
         if st.button("Start New Chat"):
             reset_chat_for_new_customer()
             st.rerun()
-
-    with flow_col:
-        st.markdown(
-            """
-            <div class="ops-grid-card">
-                <div class="ops-card-title">Smart Support Flow</div>
-                <div class="flow-step"><div class="flow-num">1</div><div class="flow-text">Choose an issue type only if the customer knows it.</div></div>
-                <div class="flow-step"><div class="flow-num">2</div><div class="flow-text">Chat naturally. Greetings do not create a support case.</div></div>
-                <div class="flow-step"><div class="flow-num">3</div><div class="flow-text">One customer conversation updates one active support case.</div></div>
-                <div class="flow-step"><div class="flow-num">4</div><div class="flow-text">Managers privately see risk, emotion, routing, and recovery actions.</div></div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
 
     st.markdown(
         """
