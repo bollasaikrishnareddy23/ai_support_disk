@@ -369,6 +369,103 @@ def sla_badge(value: str) -> str:
     return badge(value, kind)
 
 
+
+def inject_device_and_theme_css(theme: str) -> None:
+    """Apply responsive layout fixes and optional dark mode overrides."""
+    dark = str(theme).lower() == "dark"
+    if dark:
+        css = """
+        <style>
+            .stApp {
+                background:
+                    radial-gradient(circle at top left, rgba(37, 99, 235, 0.20), transparent 32%),
+                    radial-gradient(circle at top right, rgba(124, 58, 237, 0.18), transparent 34%),
+                    linear-gradient(180deg, #020617 0%, #0f172a 100%) !important;
+                color: #e5e7eb !important;
+            }
+            .glass-card, .ops-grid-card, .chat-wrap, .case-card, .queue-card, .intel-card, .kpi-card, .emotion-node {
+                background: rgba(15, 23, 42, 0.88) !important;
+                border-color: rgba(148, 163, 184, 0.28) !important;
+                box-shadow: 0 18px 45px rgba(0,0,0,0.28) !important;
+            }
+            .section-title, .ops-card-title, .case-title, .kpi-value, .emotion-name {
+                color: #f8fafc !important;
+            }
+            .muted, .case-meta, .kpi-label, .emotion-meta, .flow-text {
+                color: #cbd5e1 !important;
+            }
+            .case-message {
+                background: rgba(30, 41, 59, 0.80) !important;
+                color: #e2e8f0 !important;
+                border-color: rgba(148, 163, 184, 0.22) !important;
+            }
+            .stDataFrame, div[data-testid="stDataFrame"] {
+                background: rgba(15, 23, 42, 0.85) !important;
+                border-radius: 18px !important;
+            }
+            .stTextInput input, .stTextArea textarea, div[data-baseweb="select"] > div {
+                background: rgba(15, 23, 42, 0.92) !important;
+                color: #f8fafc !important;
+                border-color: rgba(148, 163, 184, 0.35) !important;
+            }
+        </style>
+        """
+    else:
+        css = """
+        <style>
+            .stApp {
+                background:
+                    radial-gradient(circle at top left, rgba(37, 99, 235, 0.10), transparent 32%),
+                    radial-gradient(circle at top right, rgba(16, 185, 129, 0.10), transparent 30%),
+                    linear-gradient(180deg, #f8fafc 0%, #eef2f7 100%) !important;
+            }
+        </style>
+        """
+
+    responsive_css = """
+    <style>
+        .theme-corner {
+            display: flex;
+            justify-content: flex-end;
+            margin-bottom: 0.35rem;
+        }
+        .suggestion-chip-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin: 0.4rem 0 0.8rem 0;
+        }
+        .mini-note {
+            font-size: 0.82rem;
+            color: #64748b;
+            line-height: 1.45;
+        }
+        @media (max-width: 1100px) {
+            .block-container { padding-left: 1rem !important; padding-right: 1rem !important; }
+            .hero { padding: 26px 24px !important; border-radius: 24px !important; }
+            .hero h1 { font-size: 34px !important; }
+            .hero p { font-size: 15px !important; }
+            .glass-card, .ops-grid-card, .chat-wrap, .case-card, .queue-card, .intel-card, .kpi-card { padding: 18px !important; border-radius: 22px !important; }
+        }
+        @media (max-width: 760px) {
+            section[data-testid="stSidebar"] { min-width: 230px !important; }
+            .block-container { padding-top: 0.8rem !important; padding-left: 0.7rem !important; padding-right: 0.7rem !important; }
+            .hero { padding: 22px 18px !important; border-radius: 20px !important; margin-bottom: 14px !important; }
+            .hero h1 { font-size: 27px !important; letter-spacing: -0.02em !important; }
+            .hero p { font-size: 14px !important; }
+            .section-title, .ops-card-title { font-size: 18px !important; }
+            .kpi-value { font-size: 26px !important; }
+            .badge { font-size: 11px !important; padding: 5px 9px !important; }
+            .emotion-strip { overflow-x: auto !important; flex-wrap: nowrap !important; padding-bottom: 8px !important; }
+            .emotion-node { min-width: 155px !important; }
+            .arrow-node { min-width: 24px !important; }
+            div[data-testid="stDataFrame"] { overflow-x: auto !important; }
+        }
+    </style>
+    """
+    st.markdown(css + responsive_css, unsafe_allow_html=True)
+
+
 # ============================================================
 # Secrets and Optional Clients
 # ============================================================
@@ -1640,6 +1737,10 @@ if "chat_customer_id" not in st.session_state:
     st.session_state.chat_customer_id = "C001"
 if "selected_issue_type" not in st.session_state:
     st.session_state.selected_issue_type = "Not sure yet"
+if "ui_theme" not in st.session_state:
+    st.session_state.ui_theme = "Light"
+if "message_prefill" not in st.session_state:
+    st.session_state.message_prefill = ""
 if "active_case_id" not in st.session_state:
     st.session_state.active_case_id = ""
 if "chat_messages" not in st.session_state:
@@ -1660,36 +1761,37 @@ if st.session_state.get("manager_authenticated", False):
         st.session_state.manager_authenticated = False
         st.rerun()
 
+# Top-right theme selector. Streamlit columns collapse naturally on phones/tablets.
+_theme_left, _theme_right = st.columns([0.82, 0.18])
+with _theme_right:
+    st.session_state.ui_theme = st.selectbox(
+        "Theme",
+        ["Light", "Dark"],
+        index=["Light", "Dark"].index(st.session_state.ui_theme),
+        label_visibility="collapsed",
+    )
+inject_device_and_theme_css(st.session_state.ui_theme)
+
 
 # ============================================================
 # Page 1: AI Support Chat
 # ============================================================
 
 if page == "AI Support Chat":
-    hero("AI Support Chat", "A guided support assistant that creates one case per customer conversation and gives message-specific replies.")
+    hero(
+        "AI Support Chat",
+        "A responsive guided assistant. Greetings stay friendly, real issues become one active customer case, and managers see the intelligence privately.",
+    )
 
-    flow_col, context_col = st.columns([1.0, 1.0], gap="large")
-
-    with flow_col:
-        st.markdown(
-            """
-            <div class="ops-grid-card">
-                <div class="ops-card-title">Smart Support Flow</div>
-                <div class="flow-step"><div class="flow-num">1</div><div class="flow-text">Greet the customer and understand the issue.</div></div>
-                <div class="flow-step"><div class="flow-num">2</div><div class="flow-text">Use the issue type only as a hint, not a forced category.</div></div>
-                <div class="flow-step"><div class="flow-num">3</div><div class="flow-text">One customer conversation updates one active support case.</div></div>
-                <div class="flow-step"><div class="flow-num">4</div><div class="flow-text">Managers privately see risk, emotion, routing, and recovery actions.</div></div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+    # Customer Context first, Smart Support Flow second. On mobile these stack cleanly.
+    context_col, flow_col = st.columns([1.0, 1.0], gap="large")
 
     with context_col:
         st.markdown(
             """
             <div class="ops-grid-card">
                 <div class="ops-card-title">Customer Context</div>
-                <div class="muted">Change the customer ID to automatically start a fresh conversation for that customer.</div>
+                <div class="muted">Changing the customer ID automatically starts a fresh conversation and a new active case.</div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -1708,18 +1810,55 @@ if page == "AI Support Chat":
             "Issue Type",
             ISSUE_TYPES,
             index=ISSUE_TYPES.index(st.session_state.selected_issue_type),
+            help="This is only a routing hint. The message content still decides the final topic and risk.",
         )
         if st.session_state.active_case_id:
-            st.info(f"Active case: {st.session_state.active_case_id}")
+            st.info(f"Active customer case: {st.session_state.active_case_id}")
         if st.button("Start New Chat"):
             reset_chat_for_new_customer()
             st.rerun()
+
+    with flow_col:
+        st.markdown(
+            """
+            <div class="ops-grid-card">
+                <div class="ops-card-title">Smart Support Flow</div>
+                <div class="flow-step"><div class="flow-num">1</div><div class="flow-text">Greet normally when the customer says hi/hello.</div></div>
+                <div class="flow-step"><div class="flow-num">2</div><div class="flow-text">Ask for useful details only when the issue is unclear.</div></div>
+                <div class="flow-step"><div class="flow-num">3</div><div class="flow-text">One customer conversation updates one case, not one case per message.</div></div>
+                <div class="flow-step"><div class="flow-num">4</div><div class="flow-text">Coupons and risk signals stay hidden from customers.</div></div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            """
+            <div class="glass-card">
+                <div class="ops-card-title">Quick Suggestions</div>
+                <div class="muted">Use these only for testing the assistant across devices.</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        q1, q2, q3 = st.columns(3)
+        with q1:
+            if st.button("Missing package"):
+                st.session_state.message_prefill = "My package is missing."
+                st.rerun()
+        with q2:
+            if st.button("Refund issue"):
+                st.session_state.message_prefill = "I want a refund because I received the wrong item."
+                st.rerun()
+        with q3:
+            if st.button("Sarcasm test"):
+                st.session_state.message_prefill = "Great service, my package is only 10 days late."
+                st.rerun()
 
     st.markdown(
         """
         <div class="chat-wrap">
             <div class="section-title">Support Conversation</div>
-            <div class="muted">Every actionable message updates the same support case until a new chat or new customer ID is started.</div>
+            <div class="muted">Continue naturally. The assistant gives message-specific replies and updates the same active case when the message is actionable.</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -1730,10 +1869,15 @@ if page == "AI Support Chat":
             st.write(chat["content"])
 
     with st.form("support_message_form", clear_on_submit=True):
-        user_message = st.text_input("Message", placeholder="Type your message here...")
+        user_message = st.text_input(
+            "Message",
+            value=st.session_state.message_prefill,
+            placeholder="Type your message here...",
+        )
         send_clicked = st.form_submit_button("Send Message")
 
     if send_clicked:
+        st.session_state.message_prefill = ""
         if user_message.strip() == "":
             st.warning("Please type a message before sending.")
         else:
@@ -1875,7 +2019,6 @@ elif page == "Manager Command Center":
             st.write(f"**Reason:** {record.get('coupon_reason', '')}")
             if coupon_code:
                 st.code(coupon_code)
-                st.text_area("Manager copy message", value=build_coupon_message(record), height=100, disabled=True)
 
             c1, c2, c3 = st.columns(3)
             with c1:
@@ -1892,20 +2035,7 @@ elif page == "Manager Command Center":
                     st.rerun()
 
             st.markdown("---")
-            st.markdown("### Case Handling")
-            with st.form("case_update_form"):
-                u1, u2 = st.columns(2)
-                current_status = record["status"] if record["status"] in STATUS_OPTIONS else "New"
-                current_owner = record["assigned_to"] if record["assigned_to"] in OWNER_OPTIONS else "Unassigned"
-                with u1:
-                    new_status = st.selectbox("Status", STATUS_OPTIONS, index=STATUS_OPTIONS.index(current_status))
-                    new_owner = st.selectbox("Assign To", OWNER_OPTIONS, index=OWNER_OPTIONS.index(current_owner))
-                with u2:
-                    notes = st.text_area("Internal Notes", value=str(record.get("internal_notes", "")), height=110)
-                    action = st.text_area("Resolution Action", value=str(record.get("resolution_action", "")), height=110)
-                if st.form_submit_button("Save Case Update"):
-                    update_case_record(record["case_id"], {"status": new_status, "assigned_to": new_owner, "internal_notes": notes, "resolution_action": action})
-                    st.rerun()
+            st.caption("Status and owner controls were removed from Case Review to keep this screen focused on customer risk and recovery decisions.")
 
         with tab3:
             st.subheader("Coupon Center")
@@ -1997,6 +2127,13 @@ elif page == "Journey Monitor":
                     "message": str(row.get("message", ""))[:70],
                 })
         render_emotion_journey(all_events)
+        if all_events:
+            emotion_path = " → ".join([str(event.get("emotion", "")) for event in all_events if str(event.get("emotion", "")).strip()])
+            topic_path = " → ".join([str(event.get("topic", "")) for event in all_events if str(event.get("topic", "")).strip()])
+            st.markdown("### Emotion Path")
+            st.success(emotion_path)
+            st.markdown("### Topic Path")
+            st.info(topic_path)
 
         st.subheader("Journey Table")
         st.dataframe(
